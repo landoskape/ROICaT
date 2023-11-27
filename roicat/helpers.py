@@ -17,6 +17,7 @@ import warnings
 from typing import List, Dict, Tuple, Union, Optional, Any, Callable, Iterable, Sequence, Type, Any, MutableMapping
 
 import numpy as np
+from scipy.fft import fftn, ifftn
 import torch
 import scipy.sparse
 import sparse
@@ -2785,6 +2786,29 @@ def save_gif(
 ######################################################################################################################################
 
 
+def phase_cross_corr(
+        reference: np.ndarray,
+        moving: np.ndarray
+) -> np.ndarray:
+    """
+    fast implementation of identifying the peak of the phase cross correlation of two images in fourier space
+    (see https://github.com/scikit-image/scikit-image/blob/v0.22.0/skimage/registration/_phase_cross_correlation.py#L185) 
+    """
+    assert reference.shape == moving.shape, "images must be the same shape"
+    im_shape = moving.shape
+    F_ref = fftn(reference)
+    F_mov = fftn(moving)
+    F_shift = (F_ref * np.conjugate(F_mov))
+    eps = np.finfo(F_shift.real.dtype).eps
+    shift = np.abs(ifftn(F_shift / np.maximum(np.abs(F_shift), 100*eps)))
+
+    best_shift = np.unravel_index(np.argmax(shift), im_shape)
+    midpoint = np.array([np.fix(axis_size / 2) for axis_size in im_shape])
+    shift = np.stack(best_shift)
+    shift[shift > midpoint] -= np.array(im_shape)[shift > midpoint]
+    return shift
+
+
 def mask_image_border(
     im: np.ndarray, 
     border_outer: Optional[Union[int, Tuple[int, int, int, int]]] = None, 
@@ -2996,7 +3020,8 @@ def find_geometric_transformation(
     n_iter: int = 5000,
     termination_eps: float = 1e-10,
     mask: Optional[np.ndarray] = None,
-    gaussFiltSize: int = 1
+    gaussFiltSize: int = 1,
+    use_init_estimate: bool = True,
 ) -> np.ndarray:
     """
     Find the transformation between two images.
@@ -3022,6 +3047,8 @@ def find_geometric_transformation(
             Binary mask. Regions where mask is zero are ignored during the registration. If ``None``, no mask is used. (Default is ``None``)
         gaussFiltSize (int):
             Gaussian filter size. If *0*, no gaussian filter is used. (Default is *1*)
+        use_init_estimate (bool):
+            Whether or not to use phase cross correlation estimate of warp_matrix. (Default is ``False``)
 
     Returns:
         (np.ndarray): 
@@ -3043,8 +3070,14 @@ def find_geometric_transformation(
         shape_eye = (3, 3)
     else:
         raise ValueError(f"warp_mode {warp_mode} not recognized (should not happen)")
+    
+    # Initial estimate of warp_matrix is identity
     warp_matrix = np.eye(*shape_eye, dtype=np.float32)
-
+    if use_init_estimate:
+        shift = phase_cross_corr(im_template, im_moving)
+        warp_matrix[0, 2] = shift[1] # tx (shift on axis=1)
+        warp_matrix[1, 2] = shift[0] # ty (shift on axis=0)
+    
     ## assert that the inputs are numpy arrays of dtype np.uint8
     assert isinstance(im_template, np.ndarray) and (im_template.dtype == np.uint8 or im_template.dtype == np.float32), f"im_template must be a numpy array of dtype np.uint8 or np.float32. Got {type(im_template)} of dtype {im_template.dtype}"
     assert isinstance(im_moving, np.ndarray) and (im_moving.dtype == np.uint8 or im_moving.dtype == np.float32), f"im_moving must be a numpy array of dtype np.uint8 or np.float32. Got {type(im_moving)} of dtype {im_moving.dtype}"
