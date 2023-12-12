@@ -108,6 +108,7 @@ class ROI_graph(util.ROICaT_Module):
         features_SWT: torch.Tensor,
         ROI_session_bool: torch.Tensor,
         spatialFootprint_maskPower: float = 1.0,
+        features_additional: Optional[List[torch.Tensor]] = None,
     ) -> None:
         """
         Computes the similarity graph between ROIs and updates the instance
@@ -133,6 +134,9 @@ class ROI_graph(util.ROICaT_Module):
                 more binary looking, and high values (e.g., 2.0) to make the
                 pairwise similarities highly dependent on the relative
                 intensities of the pixels in each mask. (Default is ``1.0``)
+            features_additional (List[torch.Tensor], optional):
+                Additional features to use for each ROI. Shape must be (ROI, numFeatures)
+                for each element of the list. (Default is ``None``)
 
         Returns:
             (tuple): tuple containing:
@@ -145,14 +149,22 @@ class ROI_graph(util.ROICaT_Module):
                 s_sesh (scipy.sparse.csr_matrix): 
                     Pairwise similarity matrix based on which session the ROIs belong to.
         """
+
+        # check optional arguments related to additional features
+        if features_additional is not None:
+            assert isinstance(features_additional, list), "additional features must be provided as a list of torch tensors"
+            assert all([isinstance(feat_add, torch.Tensor) for feat_add in features_additional]), "additional features must be provided as a list of torch tensors"
+            use_additional_features = True
+        else:
+            use_additional_features = False
+
         self._n_sessions = ROI_session_bool.shape[1]
         self._sf_maskPower = spatialFootprint_maskPower
 
         self.sf_cat = scipy.sparse.vstack(spatialFootprints).tocsr()
         n_roi = self.sf_cat.shape[0]
 
-
-        s_sf_all, s_NN_all, s_SWT_all, s_sesh_all, idxROI_block_all = [], [], [], [], []
+        s_sf_all, s_NN_all, s_SWT_all, s_sesh_all, s_additional_all, idxROI_block_all = [], [], [], [], [], []
 
         self.s_SWT = scipy.sparse.csr_matrix((n_roi, n_roi))
 
@@ -161,11 +173,12 @@ class ROI_graph(util.ROICaT_Module):
             idxROI_block = np.where(self.sf_cat[:, self.idxPixels_block[ii]].sum(1) > 0)[0]
             
             ## Compute pairwise similarity matrix
-            s_sf, s_NN, s_SWT, s_sesh = self._helper_compute_ROI_similarity_graph(
+            s_sf, s_NN, s_SWT, s_sesh, s_additional = self._helper_compute_ROI_similarity_graph(
                 spatialFootprints=self.sf_cat[idxROI_block].power(self._sf_maskPower),
                 features_NN=features_NN[idxROI_block],
                 features_SWT=features_SWT[idxROI_block],
                 ROI_session_bool=ROI_session_bool[idxROI_block],
+                features_additional=[fa[idxROI_block] for fa in features_additional] if features_additional is not None else None,
             )
             if s_sf is None: # If there are no ROIs in this block, s_block will be None, so we should skip the rest of the loop
                 continue
@@ -173,9 +186,13 @@ class ROI_graph(util.ROICaT_Module):
             s_NN_all.append(s_NN)
             s_SWT_all.append(s_SWT)
             s_sesh_all.append(s_sesh)
+            s_additional_all.append(s_additional)
             idxROI_block_all.append(idxROI_block)
 
             assert [len(s_NN.data)==len(s_sf.data), len(s_SWT.data)==len(s_sf.data), len(s_sesh.data)==len(s_sf.data)], 'The number of data elements in the similarity matrices should be the same.'
+            if use_additional_features:
+                assert all([len(s_sf.data)==len(s_add.data) for s_add in s_additional]), 'the number of data elements in similarity matrices must be equal (found non-equal matrix in additional features)'
+
         # return s_sf_all, s_NN_all, s_SWT_all, s_sesh_all, idxROI_block_all
 
         print('Joining blocks into full similarity matrices...') if self._verbose else None
@@ -213,7 +230,13 @@ class ROI_graph(util.ROICaT_Module):
         self.s_SWT = merge_sparse_arrays(s_SWT_all, idxROI_block_all, (n_roi, n_roi)).tocsr()
         print('Joining s_sesh...') if self._verbose else None
         self.s_sesh = merge_sparse_arrays(s_sesh_all, idxROI_block_all, (n_roi, n_roi)).tocsr()
-
+        if use_additional_features:
+            print('Joining  s_additionals...')
+            func = lambda s_add_list: merge_sparse_arrays(s_add_list, idxROI_block_all, (n_roi, n_roi)).tocsr()
+            self.s_additional = list(map(func, zip(*s_additional_all)))
+        else:
+            self.s_additional = None
+            
         ## Old method for joining sparse arrays
         # self.s_sf = scipy.sparse.lil_matrix((n_roi, n_roi))
         # self.s_NN = scipy.sparse.lil_matrix((n_roi, n_roi))
@@ -230,7 +253,7 @@ class ROI_graph(util.ROICaT_Module):
         # self.s_SWT = self.s_SWT.tocsr()
         # self.s_sesh = self.s_sesh.tocsr()
 
-        return self.s_sf, self.s_NN, self.s_SWT, self.s_sesh
+        return self.s_sf, self.s_NN, self.s_SWT, self.s_sesh, self.s_additional
 
     def _helper_compute_ROI_similarity_graph(
         self,
@@ -238,6 +261,7 @@ class ROI_graph(util.ROICaT_Module):
         features_NN: torch.Tensor,
         features_SWT: torch.Tensor,
         ROI_session_bool: np.ndarray,
+        features_additional: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[scipy.sparse.csr_matrix, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Computes the similarity matrix between ROIs based on the conjunction of
@@ -258,6 +282,9 @@ class ROI_graph(util.ROICaT_Module):
             ROI_session_bool (np.ndarray): 
                 The boolean matrix indicating which ROIs belong to which
                 session. The shape is *(n_ROIs total, n_sessions)*.
+            features_additional (List[torch.Tensor], optional):
+                Additional features to use for each ROI. Shape must be (ROI, numFeatures)
+                for each element of the list. (Default is ``None``)
 
         Returns:
             (tuple): tuple containing:
@@ -274,6 +301,14 @@ class ROI_graph(util.ROICaT_Module):
         ## if there are no ROIs in the block
         if spatialFootprints.shape[0] == 0:
             return None, None, None, None
+        
+        # check optional arguments related to additional features
+        if features_additional is not None:
+            assert isinstance(features_additional, list), "additional features must be provided as a list of torch tensors"
+            assert all([isinstance(feat_add, torch.Tensor) for feat_add in features_additional]), "additional features must be provided as a list of torch tensors"
+            use_additional_features = True
+        else:
+            use_additional_features = False
 
         sf = scipy.sparse.vstack(spatialFootprints)
         sf = sf.power(self._sf_maskPower)
@@ -312,6 +347,17 @@ class ROI_graph(util.ROICaT_Module):
         session_bool = torch.as_tensor(ROI_session_bool, device='cpu', dtype=torch.float32)
         s_sesh = torch.logical_not((session_bool @ session_bool.T).type(torch.bool))
 
+        if use_additional_features:
+            s_additional = []
+            for feat_add in features_additional:
+                c_feat_norm = torch.nn.functional.normalize(feat_add, dim=1)
+                c_feat_s = torch.matmul(c_feat_norm, c_feat_norm.T) # cosine similarity. ranges [0, 1]
+                c_feat_s[c_feat_s < 0] = 0
+                c_feat_s[range(feat_add.shape[0]), range(feat_add.shape[0])] = 0
+                s_additional.append(c_feat_s)
+        else:
+            s_additional = None
+
         # s_sf = s_sf.multiply(s_sesh.numpy())
         # s_sf.eliminate_zeros()
         # # s_NN = s_NN * s_sesh
@@ -320,18 +366,23 @@ class ROI_graph(util.ROICaT_Module):
         s_sf = s_sf.maximum(s_sf.T)
         s_NN = torch.maximum(s_NN, s_NN.T)  # force symmetry
         s_SWT = torch.maximum(s_SWT, s_SWT.T)  # force symmetry
+        if use_additional_features:
+            s_additional = [torch.maximum(s_add, s_add.T) for s_add in s_additional]
         
         s_NN  = helpers.sparse_mask(s_NN,  s_sf, do_safety_steps=True)
         s_SWT = helpers.sparse_mask(s_SWT, s_sf, do_safety_steps=True)
         s_sesh = helpers.sparse_mask(s_sesh, s_sf, do_safety_steps=True)
+        if use_additional_features:
+            s_additional = [helpers.sparse_mask(s_add, s_sf, do_safety_steps=True) for s_add in s_additional]
 
-        return s_sf, s_NN, s_SWT, s_sesh
+        return s_sf, s_NN, s_SWT, s_sesh, s_additional
 
     def make_normalized_similarities(
         self,
         centers_of_mass: Union[np.ndarray, List[np.ndarray]],
         features_NN: Optional[torch.Tensor] = None,
         features_SWT: Optional[torch.Tensor] = None,
+        features_additional: Optional[List[torch.Tensor]] = None,
         k_max: int = 3000,
         k_min: int = 200,
         algo_NN: str = 'kd_tree',
@@ -355,6 +406,9 @@ class ROI_graph(util.ROICaT_Module):
                 total, n_features)*. (Default is ``None``)
             features_SWT (torch.Tensor): 
                 The output latent embeddings of the SWT model. Shape: *(n_ROIs
+                total, n_features)*. (Default is ``None``)
+            features_additional (list of torch.Tensor):
+                Output latent embeddings of additional features. Shape: *(n_ROIs 
                 total, n_features)*. (Default is ``None``)
             k_max (int): 
                 The maximum number of nearest neighbors to consider for each
@@ -408,29 +462,53 @@ class ROI_graph(util.ROICaT_Module):
             n_workers=self._n_workers,
         )
 
+        def calculate_similarity_scores(features, self_attribute, index_attribute=None):
+            s_diff = cosine_similarity_customIdx(features.to(device), idx_diff)
+            mus = s_diff.mean(1).to('cpu').numpy()
+            stds = s_diff.std(1).to('cpu').numpy()
+            s_z = getattr(self, self_attribute)
+            if index_attribute is not None: 
+                s_z = s_z[index_attribute]
+            s_z = s_z.copy().tocoo()
+            s_z.data = ((s_z.data - mus[s_z.row]) / stds[s_z.row])
+            s_z = s_z.tocsr()
+            s_z.data[np.isnan(s_z.data)] = 0
+            return s_z
+
         ## calculate similarity scores for each ROI against the 
         ##  'different' ROIs. Note that symmetry is lost here.
         print('Normalizing Neural Network similarity scores...') if verbose else None
         if features_NN is not None:
-            s_NN_diff = cosine_similarity_customIdx(features_NN.to(device), idx_diff)
-            mus_NN_diff = s_NN_diff.mean(1).to('cpu').numpy()
-            stds_NN_diff = s_NN_diff.std(1).to('cpu').numpy()
+            self.s_NN_z = calculate_similarity_scores(features_NN, 's_NN')
+            # s_NN_diff = cosine_similarity_customIdx(features_NN.to(device), idx_diff)
+            # mus_NN_diff = s_NN_diff.mean(1).to('cpu').numpy()
+            # stds_NN_diff = s_NN_diff.std(1).to('cpu').numpy()
             
-            self.s_NN_z = self.s_NN.copy().tocoo()
-            self.s_NN_z.data = ((self.s_NN_z.data - mus_NN_diff[self.s_NN_z.row]) / stds_NN_diff[self.s_NN_z.row])
-            self.s_NN_z = self.s_NN_z.tocsr()
-            self.s_NN_z.data[np.isnan(self.s_NN_z.data)] = 0
+            # self.s_NN_z = self.s_NN.copy().tocoo()
+            # self.s_NN_z.data = ((self.s_NN_z.data - mus_NN_diff[self.s_NN_z.row]) / stds_NN_diff[self.s_NN_z.row])
+            # self.s_NN_z = self.s_NN_z.tocsr()
+            # self.s_NN_z.data[np.isnan(self.s_NN_z.data)] = 0
         
         print('Normalizing SWT similarity scores...') if verbose else None
         if features_SWT is not None:
-            s_SWT_diff = cosine_similarity_customIdx(features_SWT.to(device), idx_diff)
-            mus_SWT_diff = s_SWT_diff.mean(1).to('cpu').numpy()
-            stds_SWT_diff = s_SWT_diff.std(1).to('cpu').numpy()
+            self.s_SWT_z = calculate_similarity_scores(features_SWT, 's_SWT')
+            # s_SWT_diff = cosine_similarity_customIdx(features_SWT.to(device), idx_diff)
+            # mus_SWT_diff = s_SWT_diff.mean(1).to('cpu').numpy()
+            # stds_SWT_diff = s_SWT_diff.std(1).to('cpu').numpy()
 
-            self.s_SWT_z = self.s_SWT.copy().tocoo()
-            self.s_SWT_z.data = ((self.s_SWT_z.data - mus_SWT_diff[self.s_SWT_z.row]) / stds_SWT_diff[self.s_SWT_z.row])
-            self.s_SWT_z = self.s_SWT_z.tocsr()
-            self.s_SWT_z.data[np.isnan(self.s_SWT_z.data)] = 0
+            # self.s_SWT_z = self.s_SWT.copy().tocoo()
+            # self.s_SWT_z.data = ((self.s_SWT_z.data - mus_SWT_diff[self.s_SWT_z.row]) / stds_SWT_diff[self.s_SWT_z.row])
+            # self.s_SWT_z = self.s_SWT_z.tocsr()
+            # self.s_SWT_z.data[np.isnan(self.s_SWT_z.data)] = 0
+        
+        if features_additional is not None:
+            print('Normalizing additional feature similarity scores...') if verbose else None
+            s_additional_z = []
+            for feat_idx, feat_add in enumerate(features_additional):
+                s_additional_z.append(calculate_similarity_scores(feat_add, 's_additional', index_attribute=feat_idx))
+            self.s_additional_z = s_additional_z
+        else:
+            self.s_additional_z = None
             
 
 ###########################
