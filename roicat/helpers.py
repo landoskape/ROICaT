@@ -1,3 +1,5 @@
+from typing import List, Dict, Tuple, Union, Optional, Any, Callable, Iterable, Sequence, Type, Any, MutableMapping
+
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import multiprocessing as mp
 import os
@@ -14,16 +16,18 @@ import PIL
 from PIL import ImageTk
 import csv
 import warnings
-from typing import List, Dict, Tuple, Union, Optional, Any, Callable, Iterable, Sequence, Type, Any, MutableMapping
+import time
+import datetime
 
 import numpy as np
 import torch
+import torchvision
 import scipy.sparse
 import sparse
-from tqdm import tqdm
-import cv2
+from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 import yaml
+import optuna
 
 """
 All of these are from basic_neural_processing_modules
@@ -37,6 +41,7 @@ All of these are from basic_neural_processing_modules
 def set_device(
     use_GPU: bool = True, 
     device_num: int = 0, 
+    device_types: List[str] = ['cuda', 'mps', 'xpu', 'cpu'],
     verbose: bool = True
 ) -> str:
     """
@@ -54,6 +59,10 @@ def set_device(
             (Default is ``True``)
         device_num (int): 
             Specifies the index of the GPU to use. (Default is ``0``)
+        device_types (List[str]):
+            The types and order of devices to attempt to use. The first device
+            type that is available will be used. Options are ``'cuda'``,
+            ``'mps'``, ``'xpu'``, and ``'cpu'``.
         verbose (bool): 
             Determines whether to print the device information. \n
             * ``True``: the function will print out the device information.
@@ -66,18 +75,62 @@ def set_device(
                 A string specifying the device, either *"cpu"* or
                 *"cuda:<device_num>"*.
     """
-    if use_GPU:
-        print(f'devices available: {[torch.cuda.get_device_properties(ii) for ii in range(torch.cuda.device_count())]}') if verbose else None
-        device = f"cuda:{device_num}" if torch.cuda.is_available() else "cpu"
-        if device == "cpu":
-            print("no GPU available. Using CPU.") if verbose else None
-        else:
-            print(f"Using device: '{device}': {torch.cuda.get_device_properties(device_num)}") if verbose else None
+    devices = list_available_devices()
+
+    if not use_GPU:
+        device = 'cpu'
     else:
-        device = "cpu"
-        print(f"device: '{device}'") if verbose else None
+        device = None
+        for device_type in device_types:
+            if len(devices[device_type]) > 0:
+                device = devices[device_type][device_num]
+                break
+
+    if verbose:
+        print(f'Using device: {device}')
 
     return device
+    
+
+def list_available_devices() -> dict:
+    """
+    Lists all available PyTorch devices on the system.
+    RH 2024
+
+    Returns:
+        (dict): 
+            A dictionary with device types as keys and lists of available devices as values.
+    """
+    devices = {}
+
+    # Check for CPU devices
+    if torch.cpu.is_available():
+        devices['cpu'] = ['cpu']
+    else:
+        devices['cpu'] = []
+
+    # Check for CUDA devices
+    if torch.cuda.is_available():
+        devices['cuda'] = [f'cuda:{i}' for i in range(torch.cuda.device_count())]
+    else:
+        devices['cuda'] = []
+
+    # Check for MPS devices
+    if torch.backends.mps.is_available():
+        devices['mps'] = ['mps:0']
+    else:
+        devices['mps'] = []
+
+    # Check for XPU devices
+    if hasattr(torch, 'xpu'):
+        if torch.xpu.is_available():
+            devices['xpu'] = [f'xpu:{i}' for i in range(torch.xpu.device_count())]
+        else:
+            devices['xpu'] = []
+    else:
+        devices['xpu'] = []
+
+    return devices
 
 
 ######################################################################################################################################
@@ -199,6 +252,88 @@ def flatten_dict(d: MutableMapping, parent_key: str = '', sep: str ='.') -> Muta
             items.append((new_key, v))
     return dict(items)
 
+## parameter dictionary helpers ##
+
+def fill_in_dict(
+    d: Dict, 
+    defaults: Dict,
+    verbose: bool = True,
+    hierarchy: List[str] = ['dict'], 
+):
+    """
+    In-place. Fills in dictionary ``d`` with values from ``defaults`` if they
+    are missing. Works hierachically.
+    RH 2023
+
+    Args:
+        d (Dict):
+            Dictionary to fill in.
+            In-place.
+        defaults (Dict):
+            Dictionary of defaults.
+        verbose (bool):
+            Whether to print messages.
+        hierarchy (List[str]):
+            Used internally for recursion.
+            Hierarchy of keys to d.
+    """
+    from copy import deepcopy
+    for key in defaults:
+        if key not in d:
+            print(f"Key '{key}' not found in params dictionary: {' > '.join([f'{str(h)}' for h in hierarchy])}. Using default value: {defaults[key]}") if verbose else None
+            d.update({key: deepcopy(defaults[key])})
+        elif isinstance(defaults[key], dict):
+            assert isinstance(d[key], dict), f"Key '{key}' is a dict in defaults, but not in params. {' > '.join([f'{str(h)}' for h in hierarchy])}."
+            fill_in_dict(d[key], defaults[key], hierarchy=hierarchy+[key])
+            
+
+def check_keys_subset(d, default_dict, hierarchy=['defaults']):
+    """
+    Checks that the keys in d are all in default_dict. Raises an error if not.
+    RH 2023
+
+    Args:
+        d (Dict):
+            Dictionary to check.
+        default_dict (Dict):
+            Dictionary containing the keys to check against.
+        hierarchy (List[str]):
+            Used internally for recursion.
+            Hierarchy of keys to d.
+    """
+    default_keys = list(default_dict.keys())
+    for key in d.keys():
+        assert key in default_keys, f"Parameter '{key}' not found in defaults dictionary: {' > '.join([f'{str(h)}' for h in hierarchy])}."
+        if isinstance(default_dict[key], dict) and isinstance(d[key], dict):
+            check_keys_subset(d[key], default_dict[key], hierarchy=hierarchy+[key])
+
+
+def prepare_params(params, defaults, verbose=True):
+    """
+    Does the following:
+        * Checks that all keys in ``params`` are in ``defaults``.
+        * Fills in any missing keys in ``params`` with values from ``defaults``.
+        * Returns a deepcopy of the filled-in ``params``.
+
+    Args:
+        params (Dict):
+            Dictionary of parameters.
+        defaults (Dict):
+            Dictionary of defaults.
+        verbose (bool):
+            Whether to print messages.
+    """
+    from copy import deepcopy
+    ## Check inputs
+    assert isinstance(params, dict), f"p must be a dict. Got {type(params)} instead."
+    ## Make sure all the keys in p are valid
+    check_keys_subset(params, defaults)
+    ## Fill in any missing keys with defaults
+    params_out = deepcopy(params)
+    fill_in_dict(params_out, defaults, verbose=verbose)
+
+    return params_out
+
 
 ######################################################################################################################################
 ####################################################### MATH FUNCTIONS ###############################################################
@@ -281,6 +416,58 @@ def bounded_logspace(
     exp = 2  ## doesn't matter what this is, just needs to be > 1
 
     return exp ** np.linspace(np.log(start)/np.log(exp), np.log(stop)/np.log(exp), num, endpoint=True)
+
+
+def make_odd(n, mode='up'):
+    """
+    Make a number odd.
+    RH 2023
+
+    Args:
+        n (int):
+            Number to make odd
+        mode (str):
+            'up' or 'down'
+            Whether to round up or down to the nearest odd number
+
+    Returns:
+        output (int):
+            Odd number
+    """
+    if n % 2 == 0:
+        if mode == 'up':
+            return n + 1
+        elif mode == 'down':
+            return n - 1
+        else:
+            raise ValueError("mode must be 'up' or 'down'")
+    else:
+        return n
+def make_even(n, mode='up'):
+    """
+    Make a number even.
+    RH 2023
+
+    Args:
+        n (int):
+            Number to make even
+        mode (str):
+            'up' or 'down'
+            Whether to round up or down to the nearest even number
+
+    Returns:
+        output (int):
+            Even number
+    """
+    if n % 2 != 0:
+        if mode == 'up':
+            return n + 1
+        elif mode == 'down':
+            return n - 1
+        else:
+            raise ValueError("mode must be 'up' or 'down'")
+    else:
+        return n
 
 
 ######################################################################################################################################
@@ -387,6 +574,10 @@ class Convergence_checker_optuna:
         max_duration (float): 
             Maximum number of seconds to run before stopping. 
             (Default is *600*)
+        value_stop (Optional[float]):
+            Value at which to stop the optimization. If the best value is equal
+            to or less than this value, the optimization will stop.
+            (Default is *None*)
         verbose (bool): 
             If ``True``, print messages. 
             (Default is ``True``)
@@ -420,6 +611,7 @@ class Convergence_checker_optuna:
         tol_frac: float = 0.05, 
         max_trials: int = 350, 
         max_duration: float = 60*10, 
+        value_stop: Optional[float] = None,
         verbose: bool = True,
     ):
         """
@@ -431,6 +623,7 @@ class Convergence_checker_optuna:
         self.tol_frac = tol_frac
         self.max_trials = max_trials
         self.max_duration = max_duration
+        self.value_stop = value_stop
         self.num_trial = 0
         self.verbose = verbose
         
@@ -460,19 +653,151 @@ class Convergence_checker_optuna:
         self.bests.append(self.best)
             
         bests_recent = np.unique(self.bests[-self.n_patience:])
-        if self.num_trial > self.n_patience and ((np.abs(bests_recent.max() - bests_recent.min())/np.abs(self.best)) < self.tol_frac):
+        if self.best == 0:
+            print(f'Stopping. Best value is 0.') if self.verbose else None
+            study.stop()
+        elif self.num_trial > self.n_patience and ((np.abs(bests_recent.max() - bests_recent.min()) / np.abs(self.best)) < self.tol_frac):
             print(f'Stopping. Convergence reached. Best value ({self.best*10000}) over last ({self.n_patience}) trials fractionally changed less than ({self.tol_frac})') if self.verbose else None
             study.stop()
-        if self.num_trial >= self.max_trials:
+        elif self.num_trial >= self.max_trials:
             print(f'Stopping. Trial number limit reached. num_trial={self.num_trial}, max_trials={self.max_trials}.') if self.verbose else None
             study.stop()
-        if duration > self.max_duration:
+        elif duration > self.max_duration:
             print(f'Stopping. Duration limit reached. study.duration={duration}, max_duration={self.max_duration}.') if self.verbose else None
             study.stop()
+
+        if self.value_stop is not None:
+            if self.best <= self.value_stop:
+                print(f'Stopping. Best value ({self.best}) is less than or equal to value_stop ({self.value_stop}).') if self.verbose else None
+                study.stop()
             
         if self.verbose:
             print(f'Trial num: {self.num_trial}. Duration: {duration:.3f}s. Best value: {self.best:3e}. Current value:{trial.value:3e}') if self.verbose else None
         self.num_trial += 1
+
+
+class OptunaProgressBar:
+    """
+    A customizable progress bar for Optuna's study.optimize().
+
+    Args:
+        n_trials (int, optional): 
+            The number of trials. Exactly one of n_trials or timeout must be
+            set.
+        timeout (float, optional): 
+            The maximum time to run in seconds. Exactly one of n_trials or
+            timeout must be set.
+        tqdm_kwargs (dict, optional): 
+            Additional keyword arguments to pass to tqdm.
+            These will override the default values EXCEPT for the following
+            kwargs, which will defer to the environment variables: \n
+                * ``disable``
+                * ``dynamic_ncols``
+    """
+
+    def __init__(
+        self, 
+        n_trials: Optional[int] = None, 
+        timeout: Optional[float] = None, 
+        **tqdm_kwargs: Any,
+    ):
+        if (n_trials is None) and (timeout is None):
+            raise ValueError("Either n_trials or timeout must be set.")
+        ## Exclusivity between n_trials and timeout
+        elif (n_trials is not None) and (timeout is not None):
+            raise ValueError("Only one of n_trials or timeout should be set.")
+
+        ## Store user-provided values
+        self._n_trials = n_trials
+        self._timeout = timeout
+        self._tqdm_kwargs = self._get_default_kwargs()
+
+        ## Overwrite default values with user-provided values
+        self._tqdm_kwargs.update(tqdm_kwargs)
+
+        ## Initialize params for bar
+        self.bar = None
+        self._last_elapsed_seconds = 0.0
+
+        ## Initialize global variables for time diff
+        global _time_diff_last_call
+        _time_diff_last_call = time.time()
+        global _times_calls
+        _times_calls = []
+        global _time_start
+        _time_start = time.time()
+
+        ## Initialize progress bar
+        if self._n_trials is not None:
+            self.bar = tqdm(
+                total=self._n_trials,
+                **self._tqdm_kwargs,
+            )
+        elif self._timeout is not None:
+            total = tqdm.format_interval(self._timeout)
+            fmt = "{desc} {percentage:3.0f}%|{bar}| {elapsed}/" + total
+            self.bar = tqdm(total=self._timeout, bar_format=fmt)
+
+    def __call__(self, study: optuna.study.Study, trial: optuna.trial.FrozenTrial):
+        # Initialize progress bar on first call
+        if self.bar is None:
+            # Disable progress bar based on environment variables and context
+            if self._get_env_variables().get('disable', False):
+                self._tqdm_kwargs['disable'] = True
+
+        # Update description based on mininterval
+        current_time = time.time()
+        # Drop current time into _times_calls list
+        global _times_calls
+        min_interval = self._tqdm_kwargs.get('mininterval', 0.1)
+        global _time_diff_last_call
+        if (current_time - _time_diff_last_call >= min_interval) and all([current_time - t >= min_interval for t in _times_calls]):
+            _times_calls.append(current_time)
+            # print(_time_diff_last_call, _times_calls, current_time)
+            self._update(study)
+            _time_diff_last_call = current_time
+            ## Remove the first element of the list
+            _times_calls.pop(0)
+
+    def _update(self, study: optuna.study.Study):
+        # Update progress bar
+        if self._n_trials is not None:
+            ## Get the current trial number
+            i_trial = len(study.trials)
+            self.bar.update(i_trial - self.bar.n)
+        elif self._timeout is not None:
+            # Get the total elapsed time for the study (last trial - first trial)
+            t_start = study.trials[0].datetime_start
+            t_last = study.trials[-1].datetime_complete
+            t_last = datetime.datetime.now()
+            elapsed_seconds = t_last - t_start
+            self.bar.update(elapsed_seconds.total_seconds() - self.bar.n)
+
+        try:
+            best_value = study.best_value
+            best_trial = study.best_trial
+            self.bar.set_description(f"Best trial: {best_trial.number}, value: {best_value:.6g}")
+        except ValueError:
+            pass  # No trials completed yet
+
+    def _get_env_variables(self):
+        # Load TQDM environment variables
+        env_vars = {
+            'disable':     bool( os.environ.get('TQDM_DISABLE', '').lower() == 'true'),
+            'mininterval': float(os.environ.get('TQDM_MININTERVAL', 0.1)),
+            'maxinterval': float(os.environ.get('TQDM_MAXINTERVAL', 10.0)),
+            'miniters':    int(  os.environ.get('TQDM_MINITERS', 1)),
+            'smoothing':   float(os.environ.get('TQDM_SMOOTHING', 0.3)),
+        }
+        return env_vars
+
+    def _get_default_kwargs(self):
+        kwargs_default = self._get_env_variables()
+        
+        # Set default values for better handling in environments
+        kwargs_default.setdefault('dynamic_ncols', True)
+        kwargs_default.setdefault('leave', False)
+        return kwargs_default
 
 
 ######################################################################################################################################
@@ -984,6 +1309,10 @@ def index_with_nans(values, indices):
             Indexed array. Positions where `indices` was NaN will be filled with
             NaNs.
     """
+    ## Warn if input dtype is not NaN compatible
+    if not np.issubdtype(indices.dtype, np.floating):
+        raise ValueError('Input indices should be floating point because NaNs are used for masking. Convert to float if necessary.')
+    
     indices = np.array(indices, dtype=float) if not isinstance(indices, np.ndarray) else indices
     values = np.concatenate((np.full(shape=values.shape[1:], fill_value=np.nan, dtype=values.dtype)[None,...], values), axis=0)
     idx = indices.copy() + 1
@@ -995,6 +1324,31 @@ def index_with_nans(values, indices):
 ######################################################################################################################################
 ######################################################## FILE HELPERS ################################################################
 ######################################################################################################################################
+
+def get_nums_from_string(string_with_nums):
+    """
+    Return the numbers from a string as an int
+    RH 2021-2022
+
+    Args:
+        string_with_nums (str):
+            String with numbers in it
+    
+    Returns:
+        nums (int):
+            The numbers from the string    
+            If there are no numbers, return None.        
+    """
+    idx_nums = [ii in str(np.arange(10)) for ii in string_with_nums]
+    
+    nums = []
+    for jj, val in enumerate(idx_nums):
+        if val:
+            nums.append(string_with_nums[jj])
+    if not nums:
+        return None
+    nums = int(''.join(nums))
+    return nums
 
 
 def find_paths(
@@ -1092,7 +1446,6 @@ def find_paths(
             bytes,
             memoryview,
             np.bytes_,
-            np.unicode_,
             re.Pattern,
             re.Match,
         )):
@@ -1486,7 +1839,7 @@ def yaml_save(
     """
     path = prepare_filepath_for_saving(filepath, mkdir=mkdir, allow_overwrite=allow_overwrite)
     with open(path, mode) as f:
-        yaml.dump(obj, f, indent=indent)
+        yaml.dump(obj, f, indent=indent, sort_keys=False)
 
 def yaml_load(
     filepath: str, 
@@ -2381,7 +2734,8 @@ class ImageLabeler:
             kind (str): 
                 The type of object to return. (Default is ``'dict'``) \n
                 * ``'dict'``: {idx: label, idx: label, ...}
-                * ``'list'``: [(idx, label), (idx, label), ...]
+                * ``'list'``: [label, label, ...] where the index is the image
+                  index and unlabeled images are represented as ``'None'``.
                 * ``'dataframe'``: {'index': [idx, idx, ...], 'label': [label, label, ...]}
                   This can be converted to a pandas dataframe with:
                   pd.DataFrame(self.get_labels('dataframe'))
@@ -2404,18 +2758,15 @@ class ImageLabeler:
             return None
         
         if kind == 'dict':
-            # out = dict(self.labels_)
-            # ## Check for duplicate indices
-            # if len(out) != len(self.labels_):
-            #     warnings.warn('Duplicate indices found in labels. Only the last label for each index is returned.')
-            # return out
             return self.labels_
         elif kind == 'list':
-            # return self.labels_
-            return self.labels_.items()
+            out = ['None',] * len(self.images)
+            for idx, label in self.labels_.items():
+                out[idx] = label
+            return out
         elif kind == 'dataframe':
-            # return {'index': np.array([x[0] for x in self.labels_], dtype=np.int64), 'label': np.array([x[1] for x in self.labels_])}
-            return {'index': np.array(list(self.labels_.keys()), dtype=np.int64), 'label': np.array(list(self.labels_.values()), dtype=str)}
+            import pandas as pd
+            return pd.DataFrame(index=list(self.labels_.keys()), data={'label': list(self.labels_.values())})
 
 
 def export_svg_hv_bokeh(
@@ -3029,6 +3380,7 @@ def find_geometric_transformation(
                 Warp matrix. See cv2.findTransformECC for more info. Can be
                 applied using cv2.warpAffine or cv2.warpPerspective.
     """
+    import cv2
     LUT_modes = {
         'translation': cv2.MOTION_TRANSLATION,
         'euclidean': cv2.MOTION_EUCLIDEAN,
@@ -3081,8 +3433,8 @@ def find_geometric_transformation(
 def apply_warp_transform(
     im_in: np.ndarray,
     warp_matrix: np.ndarray,
-    interpolation_method: int = cv2.INTER_LINEAR, 
-    borderMode: int = cv2.BORDER_CONSTANT, 
+    interpolation_method: int = 1, 
+    borderMode: int = 0, 
     borderValue: int = 0
 ) -> np.ndarray:
     """
@@ -3099,11 +3451,11 @@ def apply_warp_transform(
             info.
         interpolation_method (int): 
             Interpolation method. See ``cv2.warpAffine`` for more info. (Default
-            is ``cv2.INTER_LINEAR``)
+            is ``cv2.INTER_LINEAR`` which = 1)
         borderMode (int): 
             Border mode. Determines how to handle pixels from outside the image
             boundaries. See ``cv2.warpAffine`` for more info. (Default is
-            ``cv2.BORDER_CONSTANT``)
+            ``cv2.BORDER_CONSTANT`` which = 0)
         borderValue (int): 
             Value to use for border pixels if borderMode is set to
             ``cv2.BORDER_CONSTANT``. (Default is *0*)
@@ -3114,6 +3466,7 @@ def apply_warp_transform(
                 Transformed output image with the same dimensions as the input
                 image.
     """
+    import cv2
     if warp_matrix.shape == (2, 3):
         im_out = cv2.warpAffine(
             src=im_in,
@@ -3242,6 +3595,7 @@ def remap_images(
                 The warped images. The shape will be the same as the input
                 images, which can be *(N, C, H, W)*, *(C, H, W)*, or *(H, W)*.
     """
+    import cv2
     # Check inputs
     assert isinstance(images, (np.ndarray, torch.Tensor)), f"images must be a np.ndarray or torch.Tensor"
     assert isinstance(remappingIdx, (np.ndarray, torch.Tensor)), f"remappingIdx must be a np.ndarray or torch.Tensor"
@@ -3252,8 +3606,6 @@ def remap_images(
     elif images.ndim != 4:
         raise ValueError(f"images must be a 2D, 3D, or 4D array. Got shape {images.shape}")
     assert remappingIdx.ndim == 3, f"remappingIdx must be a 3D array of shape (H, W, 2). Got shape {remappingIdx.shape}"
-    assert images.shape[-2] == remappingIdx.shape[0], f"images H ({images.shape[-2]}) must match remappingIdx H ({remappingIdx.shape[0]})"
-    assert images.shape[-1] == remappingIdx.shape[1], f"images W ({images.shape[-1]}) must match remappingIdx W ({remappingIdx.shape[1]})"
 
     # Check backend
     if backend not in ["torch", "cv2"]:
@@ -3339,6 +3691,7 @@ def remap_sparse_images(
 ) -> List[scipy.sparse.csr_matrix]:
     """
     Remaps a list of sparse images using the given remap field.
+    RH 2023
 
     Args:
         ims_sparse (Union[scipy.sparse.spmatrix, List[scipy.sparse.spmatrix]]): 
@@ -3451,7 +3804,7 @@ def remap_sparse_images(
         return warped_sparse_image
     
     wsi_partial = partial(warp_sparse_image, remappingIdx=remappingIdx)
-    ims_sparse_out = map_parallel(func=wsi_partial, args=[ims_sparse,], method='multithreading', workers=n_workers, prog_bar=verbose)
+    ims_sparse_out = map_parallel(func=wsi_partial, args=[ims_sparse,], method='multithreading', n_workers=n_workers, prog_bar=verbose)
     return ims_sparse_out
 
 
@@ -3769,7 +4122,102 @@ def cv2RemappingIdx_to_pytorchFlowField(
     normgrid = ((ri / (im_shape[None, None, :] - 1)) - 0.5) * 2  ## PyTorch's grid_sample expects grid values in [-1, 1] because it's a relative offset from the center pixel. CV2's remap expects grid values in [0, 1] because it's an absolute offset from the top-left pixel.
     ## note also that pytorch's grid_sample expects align_corners=True to correspond to cv2's default behavior.
     return normgrid
+def pytorchFlowField_to_cv2RemappingIdx(
+    normgrid: Union[np.ndarray, torch.Tensor]
+) -> Union[np.ndarray, torch.Tensor]:
+    """
+    Converts remapping indices from the PyTorch format to the OpenCV format. In
+    the OpenCV format, the displacement is in pixels relative to the top left
+    pixel of the image. In the PyTorch format, the displacement is in pixels
+    relative to the center of the image. RH 2023
 
+    Args:
+        normgrid (Union[np.ndarray, torch.Tensor]): 
+            "Flow field", in the PyTorch format. Technically not a flow field,
+            since it doesn't describe displacement. Rather, it is a remapping
+            index relative to the center of the image. Shape: *(H, W, 2)*. The
+            last dimension is (x, y).
+        
+    Returns:
+        (Union[np.ndarray, torch.Tensor]): 
+            ri (Union[np.ndarray, torch.Tensor]): 
+                Remapping indices. Each pixel describes the index of the pixel
+                in the original image that should be mapped to the new pixel.
+                Shape: *(H, W, 2)*. The last dimension is (x, y).
+    """
+    assert isinstance(normgrid, torch.Tensor), f"normgrid must be a torch.Tensor. Got {type(normgrid)}"
+    im_shape = torch.flipud(torch.as_tensor(normgrid.shape[:2], dtype=torch.float32, device=normgrid.device))  ## (W, H)
+    ri = ((normgrid / 2) + 0.5) * (im_shape[None, None, :] - 1)  ## PyTorch's grid_sample expects grid values in [-1, 1] because it's a relative offset from the center pixel. CV2's remap expects grid values in [0, 1] because it's an absolute offset from the top-left pixel.
+    return ri
+
+def resize_remappingIdx(
+    ri: Union[np.ndarray, torch.Tensor], 
+    new_shape: Tuple[int, int],
+    interpolation: str = 'BILINEAR',
+) -> Union[np.ndarray, torch.Tensor]:
+    """
+    Resize a remapping index field. This function both resizes the shape of the
+    actual remappingIdx arrays and scales the values to match the new shape.
+    RH 2024
+
+    Args:
+        ri (np.ndarray or torch.Tensor): 
+            Remapping index field(s). Describes the index of the pixel in the
+            original image that should be mapped to the new pixel. Shape (H, W,
+            2) or (B, H, W, 2). Last dimension is (x, y).
+        new_shape (Tuple[int, int]):
+            New shape of the remapping index field.
+            Shape (H', W').
+        interpolation (str): 
+            The interpolation method to use. See ``torchvision.transforms.Resize`` 
+            for options. \n
+                * ``'NEAREST'``: Nearest neighbor interpolation
+                * ``'NEAREST_EXACT'``: Nearest neighbor interpolation
+                * ``'BILINEAR'``: Bilinear interpolation
+                * ``'BICUBIC'``: Bicubic interpolation
+        antialias (bool): 
+            If ``True``, antialiasing will be used. (Default is ``False``)                
+
+    Returns:
+        ri_resized (np.ndarray or torch.Tensor):
+            Resized remapping index field.
+            Shape (H', W', 2). Last dimension is (x, y).
+    """
+    assert isinstance(ri, (np.ndarray, torch.Tensor)), f"ri must be a np.ndarray or torch.Tensor. Got {type(ri)}"
+    assert ri.ndim in [3, 4], f"ri must have shape (H, W, 2) or (B, H, W, 2). Got shape {ri.shape}"
+    assert ri.shape[-1] == 2, f"ri must have shape (H, W, 2). Got shape {ri.shape}"
+    assert isinstance(new_shape, (tuple, list, np.ndarray, torch.Tensor)), f"new_shape must be a tuple, list, np.ndarray, or torch.Tensor. Got {type(new_shape)}"
+    assert len(new_shape) == 2, f"new_shape must have length 2. Got length {len(new_shape)}"
+    
+    new_shape = (int(new_shape[0]), int(new_shape[1]))
+    
+    if ri.ndim == 3:
+        ri = ri[None, ...]
+        return_3D = True
+    else:
+        return_3D = False
+    hw_ri = ri.shape[1:3]
+    
+    if isinstance(ri, np.ndarray):
+        ri = torch.as_tensor(ri)
+        return_numpy = True
+    else:
+        return_numpy = False
+    device = ri.device
+
+    offsets = torch.as_tensor([(new_shape[1] - 1) / (hw_ri[1] - 1), (new_shape[0] - 1) / (hw_ri[0] - 1)], dtype=torch.float32, device=device)[None, None, None, ...]
+
+    ri_resized = resize_images(
+        images=ri.permute(3, 0, 1, 2),
+        new_shape=new_shape,
+        interpolation=interpolation,
+    ).permute(1, 2, 3, 0) * offsets
+
+    if return_numpy:
+        ri_resized = ri_resized.cpu().numpy()
+    if return_3D:
+        ri_resized = ri_resized[0]
+    return ri_resized
 
 def add_text_to_images(
     images: np.array, 
@@ -3779,7 +4227,6 @@ def add_text_to_images(
     color: Tuple[int, int, int] = (255,255,255), 
     line_width: int = 1, 
     font: Optional[str] = None, 
-    show: bool = False, 
     frameRate: int = 30
 ) -> np.array:
     """
@@ -3804,8 +4251,6 @@ def add_text_to_images(
         font (str):
             Font to use. If ``None``, then will use ``cv2.FONT_HERSHEY_SIMPLEX``.
             See ``cv2.FONT...`` for more options. (Default is ``None``)
-        show (bool):
-            If ``True``, then will show the images with text added. (Default is ``False``)
         frameRate (int):
             Frame rate of the video. (Default is *30*)
 
@@ -3828,85 +4273,439 @@ def add_text_to_images(
                 [fn_putText(frame[:,:,ii]) for ii in range(frame.shape[2])]
             else:
                 fn_putText(frame)
-        if show:
-            cv2.imshow('add_text_to_images', frame)
-            cv2.waitKey(int(1000/frameRate))
-    
-    if show:
-        cv2.destroyWindow('add_text_to_images')
     return images_cp
 
 
 def resize_images(
-    images: Union[np.ndarray, List[np.ndarray]], 
+    images: Union[np.ndarray, List[np.ndarray], torch.Tensor, List[torch.Tensor]], 
     new_shape: Tuple[int, int] = (100,100),
-    interpolation: str = 'linear',
+    interpolation: str = 'BILINEAR',
     antialias: bool = False,
-    align_corners: bool = False,
-    device: str = 'cpu',
+    device: Optional[str] = None,
+    return_numpy: Optional[bool] = None,
 ) -> np.ndarray:
     """
-    Resizes images using the ``torch.nn.functional.interpolate`` method.
+    Resizes images using the ``torchvision.transforms.Resize`` method.
     RH 2023
 
     Args:
-        images (Union[np.ndarray, List[np.ndarray]]): 
-            Frames of video or images. Can be 2D, 3D, or 4D. 
+        images (Union[np.ndarray, List[np.ndarray]], torch.Tensor, List[torch.Tensor]): 
+            Images or frames of a video. Can be 2D, 3D, or 4D. 
             * For a 2D array: shape is *(height, width)*
             * For a 3D array: shape is *(n_frames, height, width)*
-            * For a 4D array: shape is *(n_frames, height, width, n_channels)*
+            * For a 4D array: shape is *(n_frames, n_channels, height, width)*
         new_shape (Tuple[int, int]): 
             The desired height and width of resized images as a tuple. 
             (Default is *(100, 100)*)
         interpolation (str): 
-            The interpolation method to use. See ``torch.nn.functional.interpolate`` 
-            for options. (Default is ``'linear'``)
+            The interpolation method to use. See ``torchvision.transforms.Resize`` 
+            for options.
+            * ``'NEAREST'``: Nearest neighbor interpolation
+            * ``'NEAREST_EXACT'``: Nearest neighbor interpolation
+            * ``'BILINEAR'``: Bilinear interpolation
+            * ``'BICUBIC'``: Bicubic interpolation
         antialias (bool): 
             If ``True``, antialiasing will be used. (Default is ``False``)
-        align_corners (bool): 
-            If ``True``, the corners will be aligned. See ``torch.nn.functional.interpolate`` 
-            for details. (Default is ``False``)
-        device (str): 
-            The device to use for ``torch.nn.functional.interpolate``. 
-            (Default is ``'cpu'``)
+        device Optional[str]:
+            The device to use for ``torchvision.transforms.Resize``. If None,
+            will use the device of the input images. (Default is ``None``)
+        return_numpy Optional[bool]:
+            If ``True``, then will return a numpy array. Otherwise, will return
+            a torch tensor on the defined device. If None, will return a numpy
+            array only if the input is a numpy array. (Default is ``None``)
             
     Returns:
         (np.ndarray): 
             images_resized (np.ndarray): 
                 Frames of video or images with overlay added.
     """
+    ## Convert images to torch tensor
     if isinstance(images, list):
-        images = np.stack(images, axis=0)
-    
-    if images.ndim == 2:
-        images = images[None,:,:]
-    elif images.ndim == 3:
-        images = images
-    elif images.ndim == 4:
-        images = images.transpose(0,3,1,2)
+        if isinstance(images[0], np.ndarray):
+            device = device if device is not None else 'cpu'
+            images = torch.stack([torch.as_tensor(im, device=device) for im in images], dim=0)
+            return_numpy = True if return_numpy is None else return_numpy
+    elif isinstance(images, np.ndarray):
+        device = device if device is not None else 'cpu'
+        images = torch.as_tensor(images, device=device)
+        return_numpy = True if return_numpy is None else return_numpy
+    elif isinstance(images, torch.Tensor):
+        images = images.to(device=device)
     else:
-        raise ValueError('images must be 2D, 3D, or 4D.')
+        raise ValueError(f"images must be a np.ndarray or torch.Tensor or a list of np.ndarray or torch.Tensor. Got {type(images)}")        
     
-    images_torch = torch.as_tensor(images, device=device)
-    images_torch = torch.nn.functional.interpolate(
-        images_torch, 
-        size=tuple(np.array(new_shape, dtype=int)), 
-        mode=interpolation,
-        align_corners=align_corners,
-        recompute_scale_factor=None,
+    ## Convert images to 4D
+    def pad_to_4D(ims):
+        if ims.ndim == 2:
+            ims = ims[None, None, :, :]
+        elif ims.ndim == 3:
+            ims = ims[None, :, :, :]
+        elif ims.ndim != 4:
+            raise ValueError(f"images must be a 2D, 3D, or 4D array. Got shape {ims.shape}")
+        return ims
+    ndim_orig = images.ndim
+    images = pad_to_4D(images)
+    
+    ## Get interpolation method
+    try:
+        interpolation = getattr(torchvision.transforms.InterpolationMode, interpolation.upper())
+    except Exception as e:
+        raise Exception(f"Invalid interpolation method. See torchvision.transforms.InterpolationMode for options. Error: {e}")
+
+    resizer = torchvision.transforms.Resize(
+        size=new_shape,
+        interpolation=interpolation,
         antialias=antialias,
-    )
-    images_resized = images_torch.cpu().numpy()
-    
-    if images.ndim == 2:
-        images_resized = images_resized[0,:,:]
-    elif images.ndim == 3:
-        images_resized = images_resized
-    elif images.ndim == 4:
-        images_resized = images_resized.transpose(0,2,3,1)
+    ).to(device=device)
+    images_resized = resizer(images)
+       
+    ## Convert images back to original shape
+    def unpad_to_orig(ims, ndim_orig):
+        if ndim_orig == 2:
+            ims = ims[0,0,:,:]
+        elif ndim_orig == 3:
+            ims = ims[0,:,:,:]
+        elif ndim_orig != 4:
+            raise ValueError(f"images must be a 2D, 3D, or 4D array. Got shape {ims.shape}")
+        return ims
+    images_resized = unpad_to_orig(images_resized, ndim_orig)
+        
+    ## Convert images to numpy
+    if return_numpy == True:
+        images_resized = images_resized.detach().cpu().numpy()
     
     return images_resized
 
+
+class ImageAlignmentChecker:
+    """
+    Class to check the alignment of images using phase correlation.
+    RH 2024
+
+    Args:
+        hw (Tuple[int, int]): 
+            Height and width of the images.
+        radius_in (Union[float, Tuple[float, float]]): 
+            Radius of the pixel shift / offset that can be considered as
+            'aligned'. Used to create the 'in' filter which is an image of a
+            small centered circle that is used as a filter and multiplied by
+            the phase correlation images. If a single value is provided, the
+            filter will be a circle with radius 0 to that value; it will be
+            converted to a tuple representing a bandpass filter (0, radius_in).
+        radius_out (Union[float, Tuple[float, float]]):
+            Similar to radius_in, but for the 'out' filter, which defines the
+            'null distribution' for defining what is 'aligned'. Should be a
+            value larger than the expected maximum pixel shift / offset. If a
+            single value is provided, the filter will be a donut / taurus
+            starting at that value and ending at the edge of the smallest
+            dimension of the image; it will be converted to a tuple representing
+            a bandpass filter (radius_out, min(hw)).
+        order (int):
+            Order of the butterworth bandpass filters used to define the 'in'
+            and 'out' filters. Larger values will result in a sharper edges, but
+            values higher than 5 can lead to collapse of the filter.
+        device (str):
+            Torch device to use for computations. (Default is 'cpu')
+
+    Attributes:
+        hw (Tuple[int, int]): 
+            Height and width of the images.
+        order (int):
+            Order of the butterworth bandpass filters used to define the 'in'
+            and 'out' filters.
+        device (str):
+            Torch device to use for computations.
+        filt_in (torch.Tensor):
+            The 'in' filter used for scoring the alignment.
+        filt_out (torch.Tensor):
+            The 'out' filter used for scoring the alignment.
+    """
+    def __init__(
+        self,
+        hw: Tuple[int, int],
+        radius_in: Union[float, Tuple[float, float]],
+        radius_out: Union[float, Tuple[float, float]],
+        order: int = 5,
+        device: str = 'cpu',
+    ):
+        ## Set attributes
+        ### Convert to torch.Tensor
+        self.hw = tuple(hw)
+
+        ### Set other attributes
+        self.order = int(order)
+        self.device = str(device)
+        ### Set filter attributes
+        if isinstance(radius_in, (int, float, complex)):
+            radius_in = (float(0.0), float(radius_in))
+        elif isinstance(radius_in, (tuple, list, np.ndarray, torch.Tensor)):
+            radius_in = tuple(float(r) for r in radius_in)
+        else:
+            raise ValueError(f'radius_in must be a float or tuple of floats. Found type: {type(radius_in)}')
+        if isinstance(radius_out, (int, float, complex)):
+            radius_out = (float(radius_out), float(min(self.hw)) / 2)
+        elif isinstance(radius_out, (tuple, list, np.ndarray, torch.Tensor)):
+            radius_out = tuple(float(r) for r in radius_out)
+        else:
+            raise ValueError(f'radius_out must be a float or tuple of floats. Found type: {type(radius_out)}')
+
+        ## Make filters
+        self.filt_in, self.filt_out = (torch.as_tensor(make_2D_frequency_filter(
+            hw=self.hw,
+            low=bp[0],
+            high=bp[1],
+            order=order,
+        ), dtype=torch.float32, device=device) for bp in [radius_in, radius_out])
+    
+    def score_alignment(
+        self,
+        images: Union[np.ndarray, torch.Tensor],
+        images_ref: Optional[Union[np.ndarray, torch.Tensor]] = None,
+    ):
+        """
+        Score the alignment of a set of images using phase correlation. Computes
+        the stats of the center ('in') of the phase correlation image over the
+        stats of the outer region ('out') of the phase correlation image.
+        RH 2024
+
+        Args:
+            images (Union[np.ndarray, torch.Tensor]): 
+                A 3D array of images. Shape: *(n_images, height, width)*
+            images_ref (Optional[Union[np.ndarray, torch.Tensor]]):
+                Reference images to compare against. If provided, the images
+                will be compared against these images. If not provided, the
+                images will be compared against themselves. (Default is
+                ``None``)
+
+        Returns:
+            (Dict): 
+                Dictionary containing the following keys:
+                * 'mean_out': 
+                    Mean of the phase correlation image weighted by the
+                    'out' filter
+                * 'mean_in': 
+                    Mean of the phase correlation image weighted by the
+                    'in' filter
+                * 'ptile95_out': 
+                    95th percentile of the phase correlation image multiplied by
+                    the 'out' filter
+                * 'max_in': 
+                    Maximum value of the phase correlation image multiplied by
+                    the 'in' filter
+                * 'std_out': 
+                    Standard deviation of the phase correlation image weighted by
+                    the 'out' filter
+                * 'std_in': 
+                    Standard deviation of the phase correlation image weighted by
+                    the 'in' filter
+                * 'max_diff': 
+                    Difference between the 'max_in' and 'ptile95_out' values
+                * 'z_in': 
+                    max_diff divided by the 'std_out' value
+                * 'r_in': 
+                    max_diff divided by the 'ptile95_out' value
+        """
+        def _fix_images(ims):
+            assert isinstance(ims, (np.ndarray, torch.Tensor, list, tuple)), f'images must be np.ndarray, torch.Tensor, or a list/tuple of np.ndarray or torch.Tensor. Found type: {type(ims)}'
+            if isinstance(ims, (list, tuple)):
+                assert all(isinstance(im, (np.ndarray, torch.Tensor)) for im in ims), f'images must be np.ndarray or torch.Tensor. Found types: {set(type(im) for im in ims)}'
+                assert all(im.ndim == 2 for im in ims), f'images must be 2D arrays (height, width). Found shapes: {set(im.shape for im in ims)}'
+                if isinstance(ims[0], np.ndarray):
+                    ims = np.stack([np.array(im) for im in ims], axis=0)
+                else:
+                    ims = torch.stack([torch.as_tensor(im) for im in ims], dim=0)
+            else:
+                if ims.ndim == 2:
+                    ims = ims[None, :, :]
+                assert ims.ndim == 3, f'images must be a 3D array (n_images, height, width). Found shape: {ims.shape}'
+                assert ims.shape[1:] == self.hw, f'images must have shape (n_images, {self.hw[0]}, {self.hw[1]}). Found shape: {ims.shape}'
+
+            ims = torch.as_tensor(ims, dtype=torch.float32, device=self.device)
+            return ims
+
+        images = _fix_images(images)
+        images_ref = _fix_images(images_ref) if images_ref is not None else images
+        
+        pc = phase_correlation(images_ref[None, :, :, :], images[:, None, :, :])  ## All to all phase correlation. Shape: (n_images, n_images, height, width)
+
+        ## metrics
+        filt_in, filt_out = self.filt_in[None, None, :, :], self.filt_out[None, None, :, :]
+        mean_out = (pc * filt_out).sum(dim=(-2, -1)) / filt_out.sum(dim=(-2, -1))
+        mean_in =  (pc * filt_in).sum(dim=(-2, -1))  / filt_in.sum(dim=(-2, -1))
+        ptile95_out = torch.quantile((pc * filt_out).reshape(pc.shape[0], pc.shape[1], -1)[:, :, filt_out.reshape(-1) > 1e-3], 0.95, dim=-1)
+        max_in = (pc * filt_in).amax(dim=(-2, -1))
+        std_out = torch.sqrt(torch.mean((pc - mean_out[:, :, None, None])**2 * filt_out, dim=(-2, -1)))
+        std_in = torch.sqrt(torch.mean((pc - mean_in[:, :, None, None])**2 * filt_in, dim=(-2, -1)))
+
+        max_diff = max_in - ptile95_out
+        z_in = max_diff / std_out
+        r_in = max_diff / ptile95_out
+
+        outs = {
+            'pc': pc.cpu().numpy(),
+            'mean_out': mean_out,
+            'mean_in': mean_in,
+            'ptile95_out': ptile95_out,
+            'max_in': max_in,
+            'std_out': std_out,
+            'std_in': std_in,
+            'max_diff': max_diff,
+            'z_in': z_in,  ## z-score of in value over out distribution
+            'r_in': r_in,
+        }
+
+        outs = {k: val.cpu().numpy() if isinstance(val, torch.Tensor) else val for k, val in outs.items()}
+        
+        return outs
+    
+    def __call__(
+        self,
+        images: Union[np.ndarray, torch.Tensor],
+    ):
+        """
+        Calls the `score_alignment` method. See `self.score_alignment` docstring
+        for more info.
+        """
+        return self.score_alignment(images)
+
+
+def make_2D_frequency_filter(
+    hw: tuple,
+    low: float = 5,
+    high: float = 6,
+    order: int = 3,
+    distance_p: int = 100,
+):
+    """
+    Make a filter for scoring the alignment of images using phase correlation.
+    RH 2024
+
+    Args:
+        hw (tuple): 
+            Height and width of the images.
+        low (float): 
+            Low cutoff frequency for the bandpass filter. Units are in
+            pixels.
+        high (float): 
+            High cutoff frequency for the bandpass filter. Units are in
+            pixels.
+        order (int): 
+            Order of the butterworth bandpass filter. (Default is *3*)
+        distance_p (int):
+            Distance parameter for the distance grid. Defines the Minkowski
+            distance used to compute the distance grid.
+
+    Returns:
+        (np.ndarray): 
+            Filter for scoring the alignment. Shape: *(height, width)*
+    """
+    ## Make a distance grid starting from the fftshifted center
+    grid = make_distance_grid(shape=hw, p=distance_p, use_fftshift_center=True)
+
+    ## Make the number of datapoints for the kernel large
+    n_x = max(hw) * 10
+
+    fs = max(hw) * 1
+    low = max(0, low)
+    high = min((max(hw) / 2) - 1, high)
+    b, a = design_butter_bandpass(lowcut=low, highcut=high, fs=fs, order=order, plot_pref=False)
+    w, h = scipy.signal.freqz(b, a, worN=n_x)
+    x_kernel = (fs * 0.5 / np.pi) * w
+    kernel = np.abs(h)
+
+    ## Interpolate the kernel to the distance grid
+    filt = np.interp(
+        x=grid,
+        xp=x_kernel,
+        fp=kernel,
+    )
+
+    return filt
+
+
+def phase_correlation(
+    im_template: Union[np.ndarray, torch.Tensor],
+    im_moving: Union[np.ndarray, torch.Tensor],
+    mask_fft: Optional[Union[np.ndarray, torch.Tensor]] = None,
+    return_filtered_images: bool = False,
+    eps: float = 1e-8,
+) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """
+    Perform phase correlation on two images. Calculation performed along the
+    last two axes of the input arrays (-2, -1) corresponding to the (height,
+    width) of the images.
+    RH 2024
+
+    Args:
+        im_template (np.ndarray): 
+            The template image(s). Shape: (..., height, width). Can be any
+            number of dimensions; last two dimensions must be height and width.
+        im_moving (np.ndarray): 
+            The moving image. Shape: (..., height, width). Leading dimensions
+            must broadcast with the template image.
+        mask_fft (Optional[np.ndarray]): 
+            2D array mask for the FFT. If ``None``, no mask is used. Assumes mask_fft is
+            fftshifted. (Default is ``None``)
+        return_filtered_images (bool): 
+            If set to ``True``, the function will return filtered images in
+            addition to the phase correlation coefficient. (Default is
+            ``False``)
+        eps (float):
+            Epsilon value to prevent division by zero. (Default is ``1e-8``)
+    
+    Returns:
+        (Tuple[np.ndarray, np.ndarray, np.ndarray]): tuple containing:
+            cc (np.ndarray): 
+                The phase correlation coefficient.
+            fft_template (np.ndarray): 
+                The filtered template image. Only returned if
+                return_filtered_images is ``True``.
+            fft_moving (np.ndarray): 
+                The filtered moving image. Only returned if
+                return_filtered_images is ``True``.
+    """
+    fft2, fftshift, ifft2 = torch.fft.fft2, torch.fft.fftshift, torch.fft.ifft2
+    abs, conj = torch.abs, torch.conj
+    axes = (-2, -1)
+
+    return_numpy = isinstance(im_template, np.ndarray)
+    im_template = torch.as_tensor(im_template)
+    im_moving = torch.as_tensor(im_moving)
+
+    fft_template = fft2(im_template, dim=axes)
+    fft_moving   = fft2(im_moving, dim=axes)
+
+    if mask_fft is not None:
+        mask_fft = torch.as_tensor(mask_fft)
+        # Normalize and shift the mask
+        mask_fft = fftshift(mask_fft, dim=axes)
+        mask = mask_fft[tuple([None] * (im_template.ndim - 2) + [slice(None)] * 2)]
+        fft_template *= mask
+        fft_moving *= mask
+
+    # Compute the cross-power spectrum
+    R = fft_template * conj(fft_moving)
+
+    # Normalize to obtain the phase correlation function
+    R /= abs(R) + eps  # Add epsilon to prevent division by zero
+
+    # Compute the magnitude of the inverse FFT to ensure symmetry
+    # cc = abs(fftshift(ifft2(R, dim=axes), dim=axes))
+    # Compute the real component of the inverse FFT (not symmetric)
+    cc = fftshift(ifft2(R, dim=axes), dim=axes).real
+
+    if return_filtered_images == False:
+        return cc.cpu().numpy() if return_numpy else cc
+    else:
+        if return_numpy:
+            return (
+                cc.cpu().numpy(), 
+                abs(ifft2(fft_template, dim=axes)).cpu().numpy(), 
+                abs(ifft2(fft_moving, dim=axes)).cpu().numpy()
+            )
+        else:
+            return cc, abs(ifft2(fft_template, dim=axes)), abs(ifft2(fft_moving, dim=axes))
+        
 
 ######################################################################################################################################
 ######################################################## TIME SERIES #################################################################
@@ -4040,6 +4839,79 @@ class Convolver_1d():
         
 
 ######################################################################################################################################
+########################################################## SPECTRAL ##################################################################  
+######################################################################################################################################
+
+def design_butter_bandpass(lowcut, highcut, fs, order=5, plot_pref=False):
+    '''
+    designs a butterworth bandpass filter.
+    Makes a lowpass filter if lowcut is 0.
+    Makes a highpass filter if highcut is fs/2.
+    RH 2021
+
+        Args:
+            lowcut (scalar): 
+                frequency (in Hz) of low pass band
+            highcut (scalar):  
+                frequency (in Hz) of high pass band
+            fs (scalar): 
+                sample rate (frequency in Hz)
+            order (int): 
+                order of the butterworth filter
+        
+        Returns:
+            b (ndarray): 
+                Numerator polynomial coeffs of the IIR filter
+            a (ndarray): 
+                Denominator polynomials coeffs of the IIR filter
+    '''
+    nyq = 0.5 * fs
+    low = lowcut / nyq
+    high = highcut / nyq
+
+    if low <= 0:
+        ## Make a lowpass filter
+        b, a = scipy.signal.butter(N=order, Wn=high, btype='low')
+    elif high >= 1:
+        ## Make a highpass filter
+        b, a = scipy.signal.butter(N=order, Wn=low, btype='high')
+    else:
+        b, a = scipy.signal.butter(N=order, Wn=[low, high], btype='band')
+    
+    if plot_pref:
+        plot_digital_filter_response(b=b, a=a, fs=fs, worN=100000)
+    return b, a
+
+
+def plot_digital_filter_response(b, a=None, fs=30, worN=100000, plot_pref=True):
+    '''
+    plots the frequency response of a digital filter
+    RH 2021
+
+        Args:
+            b (ndarray): 
+                Numerator polynomial coeffs of the IIR filter
+            a (ndarray): 
+                Denominator polynomials coeffs of the IIR filter
+            fs (scalar): 
+                sample rate (frequency in Hz)
+            worN (int): 
+                number of frequencies at which to evaluate the filter
+    '''
+    w, h = scipy.signal.freqz(b, a, worN=worN) if a is not None else scipy.signal.freqz(b, worN=worN)
+    xAxis = (fs * 0.5 / np.pi) * w
+
+    if plot_pref:
+        plt.figure()
+        plt.plot(xAxis, abs(h))
+        plt.xlabel('frequency (Hz)')
+        plt.ylabel('frequency response (a.u)')
+        plt.xscale('log')
+
+    return xAxis, abs(h)
+
+
+######################################################################################################################################
 ####################################################### FEATURIZATION ################################################################
 ######################################################################################################################################
 
@@ -4110,7 +4982,7 @@ class Toeplitz_convolution2d():
         self.k = k = np.flipud(k.copy())
         self.mode = mode
         self.x_shape = x_shape
-        self.dtype = k.dtype if dtype is None else dtype
+        dtype = k.dtype if dtype is None else dtype
 
         if mode == 'valid':
             assert x_shape[0] >= k.shape[0] and x_shape[1] >= k.shape[1], "x must be larger than k in both dimensions for mode='valid'"
@@ -4119,12 +4991,12 @@ class Toeplitz_convolution2d():
 
         ## make the toeplitz matrices
         t = toeplitz_matrices = [scipy.sparse.diags(
-            diagonals=np.ones((k.shape[1], x_shape[1]), dtype=self.dtype) * k_i[::-1][:,None], 
+            diagonals=np.ones((k.shape[1], x_shape[1]), dtype=dtype) * k_i[::-1][:,None], 
             offsets=np.arange(-k.shape[1]+1, 1), 
             shape=(so[1], x_shape[1]),
-            dtype=self.dtype,
+            dtype=dtype,
         ) for k_i in k[::-1]]  ## make the toeplitz matrices for the rows of the kernel
-        tc = toeplitz_concatenated = scipy.sparse.vstack(t + [scipy.sparse.dia_matrix((t[0].shape), dtype=self.dtype)]*(x_shape[0]-1))  ## add empty matrices to the bottom of the block due to padding, then concatenate
+        tc = toeplitz_concatenated = scipy.sparse.vstack(t + [scipy.sparse.dia_matrix((t[0].shape), dtype=dtype)]*(x_shape[0]-1))  ## add empty matrices to the bottom of the block due to padding, then concatenate
 
         ## make the double block toeplitz matrix
         self.dt = double_toeplitz = scipy.sparse.hstack([self._roll_sparse(
@@ -4233,6 +5105,74 @@ class Toeplitz_convolution2d():
         return out
     
 
+def make_distance_grid(shape=(512,512), p=2, idx_center=None, return_axes=False, use_fftshift_center=False):
+    """
+    Creates a matrix of distances from the center.
+    Can calculate the Minkowski distance for any p.
+    RH 2023
+    
+    Args:
+        shape (Tuple[int, int, ...]):
+            Shape of the n-dimensional grid (i,j,k,...)
+            If a shape value is odd, the center will be the center
+             of that dimension. If a shape value is even, the center
+             will be between the two center points.
+        p (int):
+            Order of the Minkowski distance.
+            p=1 is the Manhattan distance
+            p=2 is the Euclidean distance
+            p=inf is the Chebyshev distance
+        idx_center Optional[Tuple[int, int, ...]]:
+            The index of the center of the grid. If None, the center is
+            assumed to be the center of the grid. If provided, the center
+            will be set to this index. This is useful for odd shaped grids
+            where the center is not obvious.
+        return_axes (bool):
+            If True, return the axes of the grid as well. Return will be a
+            tuple.
+        use_fft_center (bool):
+            If True, the center of the grid will be the center of the FFT
+            grid. This is useful for FFT operations where the center is
+            assumed to be the top left corner.
+
+    Returns:
+        Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+            distance_image (np.ndarray): 
+                array of distances to the center index
+            axes (Optional[np.ndarray]):
+                axes of the grid as well. Only returned if return_axes=True
+
+    """
+    if use_fftshift_center:
+        ## Find idx wheter freq=0. Use np.fft.fftfreq
+        freqs_h, freqs_w = np.fft.fftshift(np.fft.fftfreq(shape[0])), np.fft.fftshift(np.fft.fftfreq(shape[1]))
+        idx_center = (np.argmin(np.abs(freqs_h)), np.argmin(np.abs(freqs_w)))
+
+    shape = np.array(shape)
+    if idx_center is not None:
+        axes = [np.linspace(-idx_center[i], shape[i] - idx_center[i] - 1, shape[i]) for i in range(len(shape))]
+    else:
+        axes = [np.arange(-(d - 1) / 2, (d - 1) / 2 + 0.5) for d in shape]
+    grid = np.stack(
+        np.meshgrid(*axes, indexing="ij"),
+        axis=0,
+    )
+    if idx_center is not None:
+        grid_dist = np.linalg.norm(
+            grid ,
+            ord=p,
+            axis=0,
+        )
+    else:
+        grid_dist = np.linalg.norm(
+            grid,
+            ord=p,
+            axis=0,
+        )
+
+    return grid_dist if not return_axes else (grid_dist, axes)
+
+
 ######################################################################################################################################
 ##################################################### PARALLEL HELPERS ###############################################################
 ######################################################################################################################################
@@ -4261,7 +5201,7 @@ def map_parallel(
     func: Callable, 
     args: List[Any], 
     method: str = 'multithreading', 
-    workers: int = -1, 
+    n_workers: int = -1, 
     prog_bar: bool = True
 ) -> List[Any]:
     """
@@ -4296,40 +5236,28 @@ def map_parallel(
         .. highlight::python
         .. code-block::python
 
-            result = map_parallel(max, [[1,2,3,4],[5,6,7,8]], method='multiprocessing', workers=3)
+            result = map_parallel(max, [[1,2,3,4],[5,6,7,8]], method='multiprocessing', n_workers=3)
     """
-    if workers == -1:
-        workers = mp.cpu_count()
-
-    ## Get number of arguments. If args is a generator, make None.
-    n_args = len(args[0]) if hasattr(args, '__len__') else None
+    if n_workers == -1:
+        n_workers = mp.cpu_count()
 
     ## Assert that args is a list
     assert isinstance(args, list), "args must be a list"
+    ## Assert that each element of args is an iterable
+    assert all([hasattr(arg, '__iter__') for arg in args]), "All elements of args must be iterable"
 
+    ## Assert that each element has a length
+    assert all([hasattr(arg, '__len__') for arg in args]), "All elements of args must have a length"
+    ## Get number of arguments. If args is a generator, make None.
+    n_args = len(args[0]) if hasattr(args, '__len__') else None
     ## Assert that all args are the same length
     assert all([len(arg) == n_args for arg in args]), "All args must be the same length"
 
     ## Make indices
     indices = np.arange(n_args)
 
-    def wrapper(*args_index):
-        """
-        Wrapper function to catch exceptions.
-        
-        Args:
-        *args_index (tuple):
-            Tuple of arguments to be passed to the function.
-            Should take the form of (arg1, arg2, ..., argN, index)
-            The last element is the index of the job.
-        """
-        index = args_index[-1]
-        args = args_index[:-1]
-        
-        try:
-            return func(*args)
-        except Exception as e:
-            raise ParallelExecutionError(index, e)
+    ## Prepare args_map (input to map function)
+    args_map = [[func] * n_args, *args, indices]
         
     if method == 'multithreading':
         executor = ThreadPoolExecutor
@@ -4342,13 +5270,30 @@ def map_parallel(
     #     import joblib
     #     return joblib.Parallel(n_jobs=workers)(joblib.delayed(func)(arg) for arg in tqdm(args, total=n_args, disable=prog_bar!=True))
     elif method == 'serial':
-        # return [func(*arg) for arg in tqdm(args, disable=prog_bar!=True)]
-        return list(tqdm(map(wrapper, *(args + [indices])), total=n_args, disable=prog_bar!=True))
+        return    list(tqdm(map(_func_wrapper_helper, *args_map), total=n_args, disable=prog_bar!=True))
     else:
         raise ValueError(f"method {method} not recognized")
 
-    with executor(workers) as ex:
-        return list(tqdm(ex.map(wrapper, *(args + [indices])), total=n_args, disable=prog_bar!=True))
+    with executor(n_workers) as ex:
+        return list(tqdm(ex.map(_func_wrapper_helper, *args_map), total=n_args, disable=prog_bar!=True))
+def _func_wrapper_helper(*func_args_index):
+    """
+    Wrapper function to catch exceptions.
+    
+    Args:
+    *func_args_index (tuple):
+        Tuple of arguments to be passed to the function.
+        Should take the form of (func, arg1, arg2, ..., argN, index)
+        The last element is the index of the job.
+    """
+    func = func_args_index[0]
+    args = func_args_index[1:-1]
+    index = func_args_index[-1]
+
+    try:
+        return func(*args)
+    except Exception as e:
+        raise ParallelExecutionError(index, e)
 
 
 ######################################################################################################################################
@@ -4476,6 +5421,113 @@ def compute_cluster_similarity_matrices(
 
 
 ######################################################################################################################################
+########################################################### STATS ####################################################################
+######################################################################################################################################
+
+def zscore_to_pvalue(z, two_tailed=True):
+    """
+    Convert a z-score to a p-value.
+
+    Args:
+    z (float): 
+        The z-score.
+    two_tailed (bool): 
+        If True, return a two-tailed p-value. If False, return a one-tailed
+        p-value.
+
+    Returns:
+        float:
+            The p-value.
+    """
+    if two_tailed:
+        return 2 * scipy.stats.norm.sf(np.abs(z))
+    else:
+        return scipy.stats.norm.sf(np.abs(z))
+    
+
+def pvalue_to_zscore(p, two_tailed=True):
+    """
+    Convert a p-value to a z-score.
+
+    Args:
+    p (float): 
+        The p-value.
+    two_tailed (bool): 
+        If True, the p-value is two-tailed. If False, the p-value is one-tailed.
+
+    Returns:
+        float:
+            The z-score.
+    """
+    if two_tailed:
+        return scipy.stats.norm.ppf(1 - p/2)
+    else:
+        return scipy.stats.norm.ppf(1 - p)
+    
+
+######################################################################################################################################
+######################################################## SIMILARITY ##################################################################
+######################################################################################################################################
+
+
+def get_path_between_nodes(
+    idx_start: int,
+    idx_end: int,
+    predecessors: np.ndarray,
+    max_length: int = 9999,
+):
+    """
+    Finds the indices corresponding to the shortest path between two nodes in a
+    graph. Uses a predecessor matrix from a shortest path algorithm (e.g.
+    scipy.sparse.csgraph.shortest_path)
+    RH 2024
+
+    Args:
+        idx_start (int):
+            Index of the starting node.
+        idx_end (int):
+            Index of the ending node.
+        predecessors (np.ndarray):
+            Predecessor matrix from a shortest path algorithm.
+        max_length (int):
+            Maximum length of the path. (Default is 9999)
+
+    Returns:
+        path (List[int]):
+            List of node indices corresponding to the shortest path from
+            idx_start to idx_end. [idx_start, ..., idx_end]
+    """
+    ## Check inputs
+    ### Check that idx_start and idx_end are within the range of the predecessors matrix
+    assert idx_start < predecessors.shape[0], "idx_start is out of range"
+    assert idx_end < predecessors.shape[0], "idx_end is out of range"
+    ### Check that the predecessors matrix is 2D
+    assert predecessors.ndim == 2, "predecessors matrix must be 2D"
+    ### Check that the predecessors matrix is square
+    assert predecessors.shape[0] == predecessors.shape[1], "predecessors matrix must be square"
+    ### Check that idx_start, idx_end, and max_length are integers
+    assert isinstance(idx_start, int), "idx_start must be an integer"
+    assert isinstance(idx_end, int), "idx_end must be an integer"
+    assert isinstance(max_length, int), "max_length must be an integer"
+    ### Check that the path from idx_start to idx_end exists
+    assert predecessors[idx_end, idx_start] != -9999, f"Possibly no path exists. Found that path from {idx_start} to {idx_end} has value -9999 (predecessors[idx_end, idx_start] == {predecessors[idx_end, idx_start]}). This value is assumed to be a placeholder for no path."
+    
+    ## Initialize path
+    path = []
+    idx_current = int(idx_start)
+    path.append(idx_current)
+
+    ## Traverse the predecessors matrix to find the shortest path
+    while idx_current != idx_end:
+        if len(path) > max_length:
+            raise ValueError("Path length exceeds max_length")
+        idx_current = int(predecessors[idx_end, idx_current])
+        path.append(idx_current)
+
+    return path
+
+
+######################################################################################################################################
 ########################################################## TESTING ###################################################################
 ######################################################################################################################################
 
@@ -4524,7 +5576,7 @@ class Equivalence_checker():
         test: Any,
         true: Any, 
         path: Optional[List[str]] = None,
-        ) -> bool:
+    ) -> bool:
         """
         Compares the test and true values using numpy's allclose function.
 
@@ -4546,9 +5598,13 @@ class Equivalence_checker():
                     Otherwise, returns False.
         """
         try:
-            out = np.allclose(test, true, **self._kwargs_allclose)
+            ## If the dtype is a kind of string (or byte string) or object, then allclose will raise an error. In this case, just check if the values are equal.
+            if np.issubdtype(test.dtype, np.str_) or np.issubdtype(test.dtype, np.bytes_) or test.dtype == np.object_:
+                out = bool(np.all(test == true))
+            else:
+                out = np.allclose(test, true, **self._kwargs_allclose)
         except Exception as e:
-            out = None
+            out = None  ## This is not False because sometimes allclose will raise an error if the arrays have a weird dtype among other reasons.
             warnings.warn(f"WARNING. Equivalence check failed. Path: {path}. Error: {e}") if self._verbose else None
             
         if out == False:
@@ -4560,12 +5616,21 @@ class Equivalence_checker():
                 dtypes_numeric = (np.number, np.bool_, np.integer, np.floating, np.complexfloating)
                 if any([np.issubdtype(test.dtype, dtype) and np.issubdtype(true.dtype, dtype) for dtype in dtypes_numeric]):
                     diff = np.abs(test - true)
-                    r_diff = diff / np.abs(true)
+                    at = np.abs(true)
+                    r_diff = diff / at if np.all(at != 0) else np.inf
                     r_diff_mean, r_diff_max, any_nan = np.nanmean(r_diff), np.nanmax(r_diff), np.any(np.isnan(r_diff))
-                    print(f"Equivalence check failed. Path: {path}. Relative difference: mean={r_diff_mean}, max={r_diff_max}, any_nan={any_nan}") if self._verbose > 0 else None
+                    ## fraction of mismatches
+                    n_elements = np.prod(test.shape)
+                    n_mismatches = np.sum(diff > 0)
+                    frac_mismatches = n_mismatches / n_elements
+                    ## Use scientific notation and round to 3 decimal places
+                    reason = f"Equivalence: Relative difference: mean={r_diff_mean:.3e}, max={r_diff_max:.3e}, any_nan={any_nan}, n_elements={n_elements}, n_mismatches={n_mismatches}, frac_mismatches={frac_mismatches:.3e}"
                 else:
-                    print(f"Equivalence check failed. Path: {path}. Value is non-numerical.") if self._verbose > 0 else None
-        return out
+                    reason = f"Values are not numpy numeric types. types: {test.dtype}, {true.dtype}"
+        else:
+            reason = "equivlance"
+
+        return out, reason
 
     def __call__(
         self,
@@ -4602,8 +5667,20 @@ class Equivalence_checker():
             if path[-1].startswith('_'):
                 return (None, 'excluded from testing')
 
+        ## NP.NDARRAY
+        if isinstance(true, np.ndarray):
+            result = self._checker(test, true, path)
+        ## NP.SCALAR
+        elif np.isscalar(true):
+            if isinstance(test, (int, float, complex, np.number)):
+                result = self._checker(np.array(test), np.array(true), path)
+            else:
+                result = (test == true, 'equivalence')
+        ## NUMBER
+        elif isinstance(true, (int, float, complex)):
+            result = self._checker(test, true, path)
         ## DICT
-        if isinstance(true, dict):
+        elif isinstance(true, dict):
             result = {}
             for key in true:
                 if key not in test:
@@ -4614,39 +5691,51 @@ class Equivalence_checker():
         elif isinstance(true, (list, tuple, set)):
             if len(true) != len(test):
                 result = (False, 'length_mismatch')
-            result = {}
-            for idx, (i, j) in enumerate(zip(test, true)):
-                result[str(idx)] = self.__call__(i, j, path=path + [str(idx)])
-        ## NP.NDARRAY
-        elif isinstance(true, np.ndarray):
-            r = self._checker(test, true, path)
-            result = (r, 'equivalence')
-        ## NP.SCALAR
-        elif np.isscalar(true):
-            if isinstance(test, (int, float, complex, np.number)):
-                r = self._checker(np.array(test), np.array(true), path)
-                result = (r, 'equivalence')
             else:
-                result = (test == true, 'equivalence')
+                if all([isinstance(i, (int, float, complex, np.number)) for i in true]):
+                    result = self._checker(np.array(test), np.array(true), path)
+                else:
+                    result = {}
+                    for idx, (i, j) in enumerate(zip(test, true)):
+                        result[str(idx)] = self.__call__(i, j, path=path + [str(idx)])
         ## STRING
         elif isinstance(true, str):
             result = (test == true, 'equivalence')
-        ## NUMBER
-        elif isinstance(true, (int, float, complex)):
-            r = self._checker(test, true, path)
-            result = (result, 'equivalence')
         ## BOOL
         elif isinstance(true, bool):
             result = (test == true, 'equivalence')
         ## NONE
         elif true is None:
             result = (test is None, 'equivalence')
+
+        ## OBJECT with __dict__
+        elif hasattr(true, '__dict__'):
+            result = {}
+            for key in true.__dict__:
+                if key.startswith('_'):
+                    continue
+                if not hasattr(test, key):
+                    result[str(key)] = (False, 'key not found')
+                else:
+                    result[str(key)] = self.__call__(getattr(test, key), getattr(true, key), path=path + [str(key)])
         ## N/A
         else:
             result = (None, 'not tested')
 
-        if self._verbose > 1:
-            print(f"{'.'.join(path)}: {result}")
+        if isinstance(result, tuple):
+            if self._assert_mode:
+                assert (result[0] != False), f"Equivalence check failed. Path: {path}. Reason: {result[1]}"
+
+            if self._verbose > 0:
+                ## Print False results
+                if result[0] == False:
+                    print(f"Equivalence check failed. Path: {path}. Reason: {result[1]}")
+            if self._verbose > 1:
+                ## Print True results
+                if result[0] == True:
+                    print(f"Equivalence check passed. Path: {path}. Reason: {result[1]}")
+                elif result[0] is None:
+                    print(f"Equivalence check not tested. Path: {path}. Reason: {result[1]}")
 
         return result
 
@@ -4709,3 +5798,32 @@ def get_balanced_sample_weights(
         weights = class_weights
     sample_weights = weights[labels]
     return sample_weights
+
+
+def safe_set_attr(
+    obj: Any, 
+    attr: str, 
+    value: Any, 
+    overwrite: bool = False,
+) -> None:
+    """
+    Safely sets an attribute on an object. If the attribute is not present, it
+    will be created. If the attribute is present, it will only be overwritten if
+    ``overwrite`` is set to ``True``.
+    RH 2024
+
+    Args:
+        obj (Any): 
+            Object to set the attribute on.
+        attr (str): 
+            Attribute name.
+        value (Any): 
+            Value to set the attribute to.
+        overwrite (bool): 
+            Whether to overwrite the attribute if it already exists.
+            (Default is ``False``)
+    """
+    if not hasattr(obj, attr):
+        setattr(obj, attr, value)
+    elif overwrite:
+        setattr(obj, attr, value)

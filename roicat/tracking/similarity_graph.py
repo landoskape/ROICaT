@@ -74,6 +74,22 @@ class ROI_graph(util.ROICaT_Module):
         ## Imports
         super().__init__()
 
+        ## Store parameter (but not data) args as attributes
+        self.params['__init__'] = self._locals_to_params(
+            locals_dict=locals(),
+            keys=[
+                'n_workers',
+                'frame_height',
+                'frame_width',
+                'block_height',
+                'block_width',
+                'overlapping_width_Multiplier',
+                'algorithm_nearestNeigbors_spatialFootprints',
+                'verbose',
+                'kwargs_nearestNeigbors_spatialFootprints',
+            ],
+        )
+
         self._algo_sf = algorithm_nearestNeigbors_spatialFootprints
         self._kwargs_sf = kwargs_nearestNeigbors_spatialFootprints
 
@@ -145,6 +161,11 @@ class ROI_graph(util.ROICaT_Module):
                 s_sesh (scipy.sparse.csr_matrix): 
                     Pairwise similarity matrix based on which session the ROIs belong to.
         """
+        ## Store parameter (but not data) args as attributes
+        self.params['compute_similarity_blockwise'] = self._locals_to_params(
+            locals_dict=locals(),
+            keys=['spatialFootprint_maskPower',],)
+
         self._n_sessions = ROI_session_bool.shape[1]
         self._sf_maskPower = spatialFootprint_maskPower
 
@@ -234,7 +255,7 @@ class ROI_graph(util.ROICaT_Module):
 
     def _helper_compute_ROI_similarity_graph(
         self,
-        spatialFootprints: List[scipy.sparse.csr_matrix],
+        spatialFootprints: scipy.sparse.csr_matrix,
         features_NN: torch.Tensor,
         features_SWT: torch.Tensor,
         ROI_session_bool: np.ndarray,
@@ -246,9 +267,9 @@ class ROI_graph(util.ROICaT_Module):
         RH 2022
 
         Args:
-            spatialFootprints (List[scipy.sparse.csr_matrix]): 
-                The spatial footprints of the ROIs. Each matrix in the list has
-                shape *(n_ROIs for each session, FOV height * FOV width)*.
+            spatialFootprints (scipy.sparse.csr_matrix): 
+                The spatial footprints of the ROIs. with shape *(n_ROIs for each
+                session, FOV height * FOV width)*.
             features_NN (torch.Tensor): 
                 The output latent embeddings of the NN model with shape *(n_ROIs
                 total, n_features)*.
@@ -275,8 +296,7 @@ class ROI_graph(util.ROICaT_Module):
         if spatialFootprints.shape[0] == 0:
             return None, None, None, None
 
-        sf = scipy.sparse.vstack(spatialFootprints)
-        sf = sf.power(self._sf_maskPower)
+        sf = spatialFootprints.power(self._sf_maskPower)
         sf = sf.multiply( 0.5 / sf.sum(1))
         sf = scipy.sparse.csr_matrix(sf)
 
@@ -302,10 +322,12 @@ class ROI_graph(util.ROICaT_Module):
         features_NN_normd = torch.nn.functional.normalize(features_NN, dim=1)
         s_NN = torch.matmul(features_NN_normd, features_NN_normd.T) ## cosine similarity. ranges [0,1]
         s_NN[s_NN>(1-1e-5)] = 1.0
+        # s_NN[s_NN < 0] = 0
         s_NN[range(s_NN.shape[0]), range(s_NN.shape[0])] = 0
         
         features_SWT_normd = torch.nn.functional.normalize(features_SWT, dim=1)
         s_SWT = torch.matmul(features_SWT_normd, features_SWT_normd.T) ## cosine similarity. Normalized to [0,1]
+        # s_SWT[s_SWT>(1-1e-5)] = 1.0
         s_SWT[s_SWT < 0] = 0
         s_SWT[range(s_SWT.shape[0]), range(s_SWT.shape[0])] = 0
 
@@ -342,7 +364,8 @@ class ROI_graph(util.ROICaT_Module):
         Normalizes the similarity matrices **s_NN**, **s_SWT** (but not
         **s_sf**) by z-scoring using the mean and standard deviation from the
         distributions of pairwise similarities between ROIs that are spatially
-        distant from each other. 
+        distant from each other. This is done to make the similarity scores
+        more comparable across different regions of the field of view.
         RH 2022
 
         Args:
@@ -392,6 +415,17 @@ class ROI_graph(util.ROICaT_Module):
                 total)*. Note: This matrix is not symmetric and therefore should
                 be treated as a directed graph.
         """
+        ## Store parameter (but not data) args as attributes
+        self.params['make_normalized_similarities'] = self._locals_to_params(
+            locals_dict=locals(),
+            keys=[
+                'k_max',
+                'k_min',
+                'algo_NN',
+                'device',
+            ],
+        )
+
         k_max = min(k_max, self.s_NN.shape[0])
 
         print('Finding k-range of center of mass distance neighbors for each ROI...')
@@ -544,8 +578,9 @@ class ROI_graph(util.ROICaT_Module):
         im = np.zeros((self._frame_height, self._frame_width, 3))
         for ii, block in enumerate(self.blocks):
             im[block[0][0]:block[0][1], block[1][0]:block[1][1], :] = ((np.random.rand(1)+0.5)/2)
-        plt.figure()
+        fig = plt.figure()
         plt.imshow(im, vmin=0, vmax=1)
+        return fig
 
 
 def get_idx_in_kRange(
@@ -607,7 +642,7 @@ def get_idx_in_kRange(
 
     idx_nz = np.stack((d.row, d.col), axis=0).reshape(2, d.shape[0], k_max)  ## get indices of the non-zero values in the distance graph
     idx_topk = np.argpartition(np.array(d.data).reshape(d.shape[0], k_max), kth=k_min, axis=1)  ## partition the non-zero values of the distance graph at the k_min-th value
-#     idx_topk = np.argpartition(d.A, kth=k_min, axis=1)  ## partition the distance graph at the k_min-th value
+#     idx_topk = np.argpartition(d.toarray(), kth=k_min, axis=1)  ## partition the distance graph at the k_min-th value
     mesh_i, mesh_j = np.meshgrid(np.arange(k_max), np.arange(d.shape[0]))  ## prep a meshgrid of the correct output size. Will only use the row idx since the column idx will be replaced with idx_topk
     idx_diff = np.array(idx_nz.data).reshape(2, d.shape[0], k_max)[:, mesh_j[:, k_min:], idx_topk[:, k_min:]][1]  ## put it all together. Get kRange  between k_min and k_max
     return idx_diff, d

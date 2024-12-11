@@ -38,7 +38,7 @@ with open(str(_dir_parent / "roicat" / "__init__.py"), "r") as _f:
             break
 
 project = 'ROICaT'
-copyright = '2023, Rich Hakim, Joshua Zimmer, Janet Berrios, Gyu Heo'
+copyright = '2024, Rich Hakim, Joshua Zimmer, Janet Berrios, Gyu Heo'
 author = 'Rich Hakim, Joshua Zimmer, Janet Berrios, Gyu Heo'
 release = str(_version)
 
@@ -52,6 +52,7 @@ extensions = [
     'sphinx.ext.githubpages',  # allows integration with github
     'sphinx.ext.napoleon',  # parsing of different docstring styles
     'sphinx.ext.coverage',  # allows coverage of docstrings
+    'myst_parser',  # allows markdown parsing
 ]
 
 # Add any paths that contain templates here, relative to this directory.
@@ -71,6 +72,7 @@ exclude_patterns = ['_build']
 # html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
 
 html_theme = 'sphinx_rtd_theme'  ## Theme for documentation
+# html_theme = 'furo'
 # html_static_path = ['_static']
 
 # Output file base name for HTML help builder.

@@ -3,13 +3,18 @@ import warnings
 import copy
 from typing import Dict, Any, Optional, Union, List, Tuple, Callable, Iterable, Iterator, Type
 import datetime
-
+import collections
 import importlib
 
 import numpy as np
 import scipy.sparse
+from tqdm import tqdm
+import torch
+
+import richfile as rf
 
 from . import helpers
+
 
 def get_roicat_version() -> str:
     """
@@ -21,6 +26,7 @@ def get_roicat_version() -> str:
                 The version of the roicat package.
     """
     return importlib.metadata.version('roicat')
+
 
 def get_default_parameters(
     pipeline='tracking', 
@@ -54,13 +60,13 @@ def get_default_parameters(
         defaults = helpers.yaml_load(path_defaults)
     else:
         defaults = {
-            'general' : {
+            'general': {
                 'use_GPU': True,
                 'verbose': True,
                 'random_seed': None,
             },
             'data_loading': {
-                'data_kind': 'suite2p',  ## Can be 'suite2p', 'roiextractors', or 'roicat'. See documentation and/or notebook on custom data loading for more details.
+                'data_kind': 'data_suite2p',  ## Can be 'suite2p', 'roiextractors', or 'roicat'. See documentation and/or notebook on custom data loading for more details.
                 'dir_outer': None,  ## directory where directories containing below 'pathSuffixTo...' are
                 'common': {
                     'um_per_pixel': 1.0,  ## Number of microns per pixel for the imaging dataset. Doesn't need to be exact. Used for resizing the ROIs. Check the images of the resized ROIs to tweak.
@@ -72,32 +78,97 @@ def get_default_parameters(
                     'type_meanImg': 'meanImgE',  ## Can be 'meanImg' or 'meanImgE'. 'meanImg' is the mean image of the dataset, 'meanImgE' is the mean image of the dataset after contrast enhancement.
                 },
                 'data_roicat': {
-                    'filename_search': r'data_roicat.pkl',  ## Name stem of the single file (as a regex search string) in 'dir_outer' to look for. The files should be saved Data_roicat object.
+                    'filename_search': r'data_roicat.richfile',  ## Name stem of the single file (as a regex search string) in 'dir_outer' to look for. The files should be saved Data_roicat object.
                 },
             },
             'alignment': {
+                'initialization': {
+                    'use_match_search': True,  ## Whether or not to use our match search algorithm to initialize the alignment.
+                    'all_to_all': False,  ## Force the use of our match search algorithm for all-pairs matching. Much slower (False: O(N) vs. True: O(N^2)), but more accurate.
+                    'radius_in': 4.0,  ## Value in micrometers used to define the maximum shift/offset between two images that are considered to be aligned. Larger means more lenient alignment.
+                    'radius_out': 20.0,  ## Value in micrometers used to define the minimum shift/offset between two images that are considered to be misaligned.
+                    'z_threshold': 4.0,  ## Z-score required to define two images as aligned. Larger values results in more stringent alignment requirements.
+                },
                 'augment': {
+                    'normalize_FOV_intensities': True,  ## Whether or not to normalize the FOV_images to the max value across all FOV images.
                     'roi_FOV_mixing_factor': 0.5,  ## default: 0.5. Fraction of the max intensity projection of ROIs that is added to the FOV image. 0.0 means only the FOV_images, larger values mean more of the ROIs are added.
                     'use_CLAHE': True,  ## Whether or not to use 'Contrast Limited Adaptive Histogram Equalization'. Useful if params['importing']['type_meanImg'] is not a contrast enhanced image (like 'meanImgE' in Suite2p)
-                    'CLAHE_grid_size': 1,  ## Size of the grid for CLAHE. 1 means no grid, 2 means 2x2 grid, etc.
-                    'CLAHE_clipLimit': 1,  ## Clipping limit for CLAHE. Higher values mean more contrast.
+                    'CLAHE_grid_block_size': 10,  ## Size of the block size for the grid for CLAHE. Smaller values means more local contrast enhancement.
+                    'CLAHE_clipLimit': 1.0,  ## Clipping limit for CLAHE. Higher values mean more contrast.
                     'CLAHE_normalize': True,  ## Whether or not to normalize the CLAHE image.
                 },
                 'fit_geometric': {
                     'template': 0.5,  ## Which session to use as a registration template. If input is float (ie 0.0, 0.5, 1.0, etc.), then it is the fractional position of the session to use; if input is int (ie 1, 2, 3), then it is the index of the session to use (0-indexed)
-                    'template_method': 'sequential',  ## Can be 'sequential' or 'image'. If 'sequential', then the template is the FOV_image of the previous session. If 'image', then the template is the FOV_image of the session specified by 'template'.
-                    'mode_transform': 'homography',  ## Must be one of {'translation', 'affine', 'euclidean', 'homography'}. See documentation for more details.
-                    'mask_borders': [50, 50, 50, 50],  ## Number of pixels to mask from the borders of the FOV_image. Useful for removing artifacts from the edges of the FOV_image.
-                    'n_iter': 50,  ## Number of iterations to run the registration algorithm. More iterations means more accurate registration, but longer run time.
-                    'termination_eps': 1e-09,  ## Termination criteria for the registration algorithm. See documentation for more details.
-                    'gaussFiltSize': 31,  ## Size of the gaussian filter used to smooth the FOV_image before registration. Larger values mean more smoothing.
-                    'auto_fix_gaussFilt_step': 10,  ## If the registration fails, then the gaussian filter size is reduced by this amount and the registration is tried again.
+                    'template_method': 'image',  ## Can be 'sequential' or 'image'. If 'sequential', then the template is the FOV_image of the previous session. If 'image', then the template is the FOV_image of the session specified by 'template'.
+                    'mask_borders': [0, 0, 0, 0],  ## Number of pixels to mask from the borders of the FOV_image. Useful for removing artifacts from the edges of the FOV_image.
+                    'method': 'RoMa',  ## Accuracy order (best to worst): RoMa (by far, but slow without a GPU), LoFTR, DISK_LightGlue, ECC_cv2, (the following are not recommended) SIFT, ORB
+                    'kwargs_method': {
+                        'RoMa': {
+                            'model_type': 'outdoor',
+                            'n_points': 10000,  ## Higher values mean more points are used for the registration. Useful for larger FOV_images. Larger means slower.
+                            'batch_size': 1000,
+                        },
+                        'DISK_LightGlue': {
+                            'num_features': 3000,  ## Number of features to extract and match. I've seen best results around 2048 despite higher values typically being better.
+                            'threshold_confidence': 0.2,  ## Higher values means fewer but better matches.
+                        },
+                        'LoFTR': {
+                            'model_type': 'indoor_new',
+                            'threshold_confidence': 0.2,  ## Higher values means fewer but better matches.
+                        },
+                        'ECC_cv2': {
+                            'mode_transform': 'euclidean',  ## Must be one of {'translation', 'affine', 'euclidean', 'homography'}. See cv2 documentation on findTransformECC for more details.
+                            'n_iter': 200,
+                            'termination_eps': 1e-09,  ## Termination criteria for the registration algorithm. See documentation for more details.
+                            'gaussFiltSize': 1,  ## Size of the gaussian filter used to smooth the FOV_image before registration. Larger values mean more smoothing.
+                            'auto_fix_gaussFilt_step': 10,  ## If the registration fails, then the gaussian filter size is reduced by this amount and the registration is tried again.
+                        },
+                        'PhaseCorrelation': {
+                            'bandpass_freqs': [1, 30],
+                            'order': 5,
+                        },
+                        'SIFT': {
+                            'nfeatures': 10000,
+                            'contrastThreshold': 0.04,
+                            'edgeThreshold': 10,
+                            'sigma': 1.6,
+                        },
+                        'ORB': {
+                            'nfeatures': 1000,
+                            'scaleFactor': 1.2,
+                            'nlevels': 8,
+                            'edgeThreshold': 31,
+                            'firstLevel': 0,
+                            'WTA_K': 2,
+                            'scoreType': 0,
+                            'patchSize': 31,
+                            'fastThreshold': 20,
+                        },
+                    },
+                    'kwargs_RANSAC': {  ## Parameters related to the RANSAC algorithm used for point/descriptor based registration methods.
+                        'inl_thresh': 3.0,  ## Threshold for the inliers. Larger values mean more points are considered inliers.
+                        'max_iter': 100,  ## Maximum number of iterations for the RANSAC algorithm.
+                        'confidence': 0.99,  ## Confidence level for the RANSAC algorithm. Larger values mean more points are considered inliers.
+                    },
                 },
                 'fit_nonrigid': {
                     'template': 0.5,  ## Which session to use as a registration template. If input is float (ie 0.0, 0.5, 1.0, etc.), then it is the fractional position of the session to use; if input is int (ie 1, 2, 3), then it is the index of the session to use (0-indexed)
                     'template_method': 'image',  ## Can be 'sequential' or 'image'. If 'sequential', then the template is the FOV_image of the previous session. If 'image', then the template is the FOV_image of the session specified by 'template'.
-                    'mode_transform': 'createOptFlow_DeepFlow',  ## Can be 'createOptFlow_DeepFlow' or 'calcOpticalFlowFarneback'. See documentation for more details.
-                    'kwargs_mode_transform': None,  ## Keyword arguments for the mode_transform function. See documentation for more details.
+                    'method': 'DeepFlow',
+                    'kwargs_method': {
+                        'RoMa': {
+                            'model_type': 'outdoor',
+                        },
+                        'DeepFlow': {},
+                        'OpticalFlowFarneback': {
+                            'pyr_scale': 0.7,
+                            'levels': 5,
+                            'winsize': 128,
+                            'iterations': 15,
+                            'poly_n': 5,
+                            'poly_sigma': 1.5,            
+                        },
+                    },
                 },
                 'transform_ROIs': {
                     'normalize': True,  ## If True, normalize the spatial footprints to have a sum of 1.
@@ -143,7 +214,8 @@ def get_default_parameters(
                 },
             },
             'clustering': {
-                'automatic_mixing': {
+                'mixing_method': 'automatic',  ## Can be 'automatic' or 'manual'. If 'automatic', then the parameters are found automatically. If 'manual', then the parameters are set manually.
+                'parameters_automatic_mixing': {
                     'n_bins': None,  ## Number of bins to use for the histograms of the distributions
                     'smoothing_window_bins': None,  ## Number of bins to use to smooth the distributions
                     'kwargs_findParameters': {
@@ -153,15 +225,27 @@ def get_default_parameters(
                         'max_duration': 60*10,  ## Max amount of time (in seconds) to allow optimization to proceed for
                     },
                     'bounds_findParameters': {
-                        'power_NN': [0., 5.],  ## Bounds for the exponent applied to s_NN
-                        'power_SWT': [0., 5.],  ## Bounds for the exponent applied to s_SWT
-                        'p_norm': [-5, 0],  ## Bounds for the p-norm p value (Minkowski) applied to mix the matrices
+                        'power_NN': [0.0, 2.],  ## Bounds for the exponent applied to s_NN
+                        'power_SWT': [0.0, 2.],  ## Bounds for the exponent applied to s_SWT
+                        'p_norm': [-5, -0.1],  ## Bounds for the p-norm p value (Minkowski) applied to mix the matrices
                         'sig_NN_kwargs_mu': [0., 1.0],  ## Bounds for the sigmoid center for s_NN
-                        'sig_NN_kwargs_b': [0.00, 1.5],  ## Bounds for the sigmoid slope for s_NN
-                        'sig_SWT_kwargs_mu': [0., 1.0], ## Bounds for the sigmoid center for s_SWT
-                        'sig_SWT_kwargs_b': [0.00, 1.5],  ## Bounds for the sigmoid slope for s_SWT
+                        'sig_NN_kwargs_b': [0.1, 1.5],  ## Bounds for the sigmoid slope for s_NN
+                        'sig_SWT_kwargs_mu': [0., 1.0],  ## Bounds for the sigmoid center for s_SWT
+                        'sig_SWT_kwargs_b': [0.1, 1.5],  ## Bounds for the sigmoid slope for s_SWT
                     },
                     'n_jobs_findParameters': -1,  ## Number of CPU cores to use (-1 is all cores)
+                },
+                'parameters_manual_mixing': {
+                    'power_SF': 1.0,   ## s_sf**power_SF   (Higher values means clustering is more sensitive to spatial overlap of ROIs)
+                    'power_NN': 0.5,   ## s_NN**power_NN   (Higher values means clustering is more sensitive to visual similarity of ROIs)
+                    'power_SWT': 0.5,  ## s_SWT**power_SWT (Higher values means clustering is more sensitive to visual similarity of ROIs)
+                    'p_norm': -1.0,    ## norm([s_sf, s_NN, s_SWT], p=p_norm) (Higher values means clustering requires all similarity metrics to be high)
+                #     'sig_SF_kwargs': {'mu':0.5, 'b':1.0},  ## Sigmoid parameters for s_sf (mu is the center, b is the slope)
+                    'sig_SF_kwargs': None,
+                    'sig_NN_kwargs': {'mu': 0.5, 'b': 1.0},  ## Sigmoid parameters for s_NN (mu is the center, b is the slope)
+                #     'sig_NN_kwargs': None,
+                    'sig_SWT_kwargs': {'mu': 0.5, 'b': 1.0},  ## Sigmoid parameters for s_SWT (mu is the center, b is the slope)
+                #     'sig_SWT_kwargs': None,
                 },
                 'pruning': {
                     'd_cutoff': None,  ## Optionally manually specify a distance cutoff
@@ -170,7 +254,7 @@ def get_default_parameters(
                 },
                 'cluster_method': {
                     'method': 'automatic',  ## 'automatic', 'hdbscan', or 'sequential_hungarian'. 'automatic': selects which clustering algorithm to use (generally if n_sessions >=8 then hdbscan, else sequential_hungarian)
-                    'n_sessions_switch': 8, ## Number of sessions to switch from sequential_hungarian to hdbscan
+                    'n_sessions_switch': 6, ## Number of sessions to switch from sequential_hungarian to hdbscan
                 },
                 'hdbscan': {
                     'min_cluster_size': 2,  ## Minimum number of ROIs that can be considered a 'cluster'
@@ -250,84 +334,6 @@ def get_default_parameters(
 
     return out
 
-def fill_in_params(
-    d: Dict, 
-    defaults: Dict,
-    verbose: bool = True,
-    hierarchy: List[str] = ['params'], 
-):
-    """
-    In-place. Fills in dictionary ``d`` with values from ``defaults`` if they
-    are missing. Works hierachically.
-    RH 2023
-
-    Args:
-        d (Dict):
-            Dictionary to fill in.
-            In-place.
-        defaults (Dict):
-            Dictionary of defaults.
-        verbose (bool):
-            Whether to print messages.
-        hierarchy (List[str]):
-            Used internally for recursion.
-            Hierarchy of keys to d.
-    """
-    from copy import deepcopy
-    for key in defaults:
-        if key not in d:
-            print(f"Parameter '{key}' not found in params dictionary: {' > '.join([f'{str(h)}' for h in hierarchy])}. Using default value: {defaults[key]}") if verbose else None
-            d.update({key: deepcopy(defaults[key])})
-        elif isinstance(defaults[key], dict):
-            assert isinstance(d[key], dict), f"Parameter '{key}' must be a dictionary."
-            fill_in_params(d[key], defaults[key], hierarchy=hierarchy+[key])
-            
-def check_keys_subset(d, default_dict, hierarchy=['defaults']):
-    """
-    Checks that the keys in d are all in default_dict. Raises an error if not.
-    RH 2023
-
-    Args:
-        d (Dict):
-            Dictionary to check.
-        default_dict (Dict):
-            Dictionary containing the keys to check against.
-        hierarchy (List[str]):
-            Used internally for recursion.
-            Hierarchy of keys to d.
-    """
-    default_keys = list(default_dict.keys())
-    for key in d.keys():
-        assert key in default_keys, f"Parameter '{key}' not found in defaults dictionary: {' > '.join([f'{str(h)}' for h in hierarchy])}."
-        if isinstance(default_dict[key], dict) and isinstance(d[key], dict):
-            check_keys_subset(d[key], default_dict[key], hierarchy=hierarchy+[key])
-
-def prepare_params(params, defaults, verbose=True):
-    """
-    Does the following:
-        * Checks that all keys in ``params`` are in ``defaults``.
-        * Fills in any missing keys in ``params`` with values from ``defaults``.
-        * Returns a deepcopy of the filled-in ``params``.
-
-    Args:
-        params (Dict):
-            Dictionary of parameters.
-        defaults (Dict):
-            Dictionary of defaults.
-        verbose (bool):
-            Whether to print messages.
-    """
-    from copy import deepcopy
-    ## Check inputs
-    assert isinstance(params, dict), f"p must be a dict. Got {type(params)} instead."
-    ## Make sure all the keys in p are valid
-    check_keys_subset(params, defaults)
-    ## Fill in any missing keys with defaults
-    params_out = deepcopy(params)
-    fill_in_params(params_out, defaults, verbose=verbose)
-
-    return params_out
-
 
 def system_info(verbose: bool = False,) -> Dict:
     """
@@ -350,7 +356,7 @@ def system_info(verbose: bool = False,) -> Dict:
         try:
             return fn()
         except:
-            return None
+            return None        
     fns = {key: val for key, val in platform.__dict__.items() if (callable(val) and key[0] != '_')}
     operating_system = {key: try_fns(val) for key, val in fns.items() if (callable(val) and key[0] != '_')}
     print(f'== Operating System ==: {operating_system["uname"]}') if verbose else None
@@ -428,13 +434,13 @@ def system_info(verbose: bool = False,) -> Dict:
         print('== CUDA is not available ==') if verbose else None
 
     ## all packages in environment
-    import pkg_resources
-    pkgs_dict = {i.key: i.version for i in pkg_resources.working_set}
+    import importlib.metadata
+    pkgs_dict = {dist.metadata['Name'].lower(): dist.version for dist in importlib.metadata.distributions()}
 
     ## roicat
     import time
-    roicat_version = pkg_resources.get_distribution("roicat").version        
-    roicat_fileDate = time.ctime(os.path.getctime(pkg_resources.get_distribution("roicat").location))
+    roicat_version = importlib.metadata.version("roicat")
+    roicat_fileDate = time.ctime(os.path.getctime(importlib.metadata.distribution("roicat").locate_file('')))
     roicat_stuff = {'version': roicat_version, 'date_installed': roicat_fileDate}
     print(f'== ROICaT Version ==: {roicat_version}') if verbose else None
     print(f'== ROICaT date installed ==: {roicat_fileDate}') if verbose else None
@@ -461,7 +467,57 @@ def system_info(verbose: bool = False,) -> Dict:
         'pkgs': pkgs_dict,
     }
 
+    def conv_str(obj):
+        if isinstance(obj, (dict, collections.OrderedDict)):
+            return {key: conv_str(val) for key, val in obj.items()}
+        elif isinstance(obj, (list, tuple, set, frozenset)):
+            return [conv_str(val) for val in obj]
+        elif isinstance(obj, (int, float, bool, type(None))):
+            return obj
+        else:
+            return str(obj)
+        
+    versions = conv_str(versions)
+
     return versions
+
+
+def set_random_seed(seed=None, deterministic=False):
+    """
+    Set random seed for reproducibility.
+    RH 2023
+
+    Args:
+        seed (int, optional):
+            Random seed.
+            If None, a random seed (spanning int32 integer range) is generated.
+        deterministic (bool, optional):
+            Whether to make packages deterministic.
+
+    Returns:
+        (int):
+            seed (int):
+                Random seed.
+    """
+    ### random seed (note that optuna requires a random seed to be set within the pipeline)
+    import numpy as np
+    seed = int(np.random.randint(0, 2**31 - 1, dtype=np.uint32)) if seed is None else seed
+
+    np.random.seed(seed)
+    import torch
+    torch.manual_seed(seed)
+    import random
+    random.seed(seed)
+    import cv2
+    cv2.setRNGSeed(seed)
+
+    ## Make torch deterministic
+    torch.use_deterministic_algorithms(deterministic)
+    ## Make cudnn deterministic
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
+    
+    return seed
 
 
 class ROICaT_Module:
@@ -479,6 +535,8 @@ class ROICaT_Module:
         Initializes the ROICaT_Module class by gathering system information.
         """
         self._system_info = system_info()
+        
+        self.params = {}
         pass
 
     @property
@@ -570,85 +628,490 @@ class ROICaT_Module:
         serializable_dict = make_serializable_dict(self, depth=0, max_depth=100, name='self')
         return serializable_dict
 
-    def save(
-        self, 
-        path_save: Union[str, Path],
-        save_as_serializable_dict: bool = False,
-        allow_overwrite: bool = False,
-    ) -> None:
-        """
-        Saves Data_roicat object to pickle file.
 
-        Args:
-            path_save (Union[str, pathlib.Path]): 
-                Path to save pickle file.
-            save_as_serializable_dict (bool): 
-                An archival-type format that is easy to load data from, but typically 
-                cannot be used to re-instantiate the object. If ``True``, save the object 
-                as a serializable dictionary. If ``False``, save the object as a Data_roicat 
-                object. (Default is ``False``)
-            allow_overwrite (bool): 
-                If ``True``, allow overwriting of existing file. (Default is ``False``)
+    # def save(
+    #     self, 
+    #     path_save: Union[str, Path],
+    #     save_as_serializable_dict: bool = False,
+    #     allow_overwrite: bool = False,
+    # ) -> None:
+    #     """
+    #     Saves Data_roicat object to pickle file.
 
-        """
-        from pathlib import Path
-        ## Check if file already exists
-        if not allow_overwrite:
-            assert not Path(path_save).exists(), f"RH ERROR: File already exists: {path_save}. Set allow_overwrite=True to overwrite."
+    #     Args:
+    #         path_save (Union[str, pathlib.Path]): 
+    #             Path to save pickle file.
+    #         save_as_serializable_dict (bool): 
+    #             An archival-type format that is easy to load data from, but typically 
+    #             cannot be used to re-instantiate the object. If ``True``, save the object 
+    #             as a serializable dictionary. If ``False``, save the object as a Data_roicat 
+    #             object. (Default is ``False``)
+    #         allow_overwrite (bool): 
+    #             If ``True``, allow overwriting of existing file. (Default is ``False``)
 
-        helpers.pickle_save(
-            obj=self.serializable_dict if save_as_serializable_dict else self,
-            filepath=path_save,
-            mkdir=True,
-            allow_overwrite=allow_overwrite,
-        )
-        print(f"Saved Data_roicat as a pickled object to {path_save}.") if self._verbose else None
+    #     """
+    #     from pathlib import Path
+    #     ## Check if file already exists
+    #     if not allow_overwrite:
+    #         assert not Path(path_save).exists(), f"RH ERROR: File already exists: {path_save}. Set allow_overwrite=True to overwrite."
 
-    def load(
+    #     helpers.pickle_save(
+    #         obj=self.serializable_dict if save_as_serializable_dict else self,
+    #         filepath=path_save,
+    #         mkdir=True,
+    #         allow_overwrite=allow_overwrite,
+    #     )
+    #     print(f"Saved Data_roicat as a pickled object to {path_save}.") if self._verbose else None
+
+    # def load(
+    #     self,
+    #     path_load: Union[str, Path],
+    # ) -> None:
+    #     """
+    #     Loads attributes from a Data_roicat object from a pickle file.
+
+    #     Args:
+    #         path_load (Union[str, Path]): 
+    #             Path to the pickle file.
+
+    #     Note: 
+    #         After calling this method, the attributes of this object are updated with those 
+    #         loaded from the pickle file. If an object in the pickle file is a dictionary, 
+    #         the object's attributes are set directly from the dictionary. Otherwise, if 
+    #         the object in the pickle file has a 'import_from_dict' method, it is used 
+    #         to load attributes. If it does not, the attributes are directly loaded from 
+    #         the object's `__dict__` attribute.
+
+    #     Example:
+    #         .. highlight:: python
+    #         .. code-block:: python
+
+    #             obj = Data_roicat()
+    #             obj.load('/path/to/pickle/file')
+    #     """
+    #     from pathlib import Path
+    #     assert Path(path_load).exists(), f"RH ERROR: File does not exist: {path_load}."
+    #     obj = helpers.pickle_load(path_load)
+    #     assert isinstance(obj, (type(self), dict)), f"RH ERROR: Loaded object is not a Data_roicat object or dictionary. Loaded object is of type {type(obj)}."
+
+    #     if isinstance(obj, dict):
+    #         ## Set attributes from dict
+    #         ### If the subclass has a load_from_dict method, use that.
+    #         if hasattr(self, 'import_from_dict'):
+    #             self.import_from_dict(obj)
+    #         else:
+    #             for key, val in obj.items():
+    #                 setattr(self, key, val)
+    #     else:
+    #         ## Set attributes from object
+    #         for key, val in obj.__dict__.items():
+    #             setattr(self, key, val)
+
+    #     print(f"Loaded Data_roicat object from {path_load}.") if self._verbose else None
+
+
+    def _locals_to_params(
         self,
-        path_load: Union[str, Path],
+        locals_dict: Dict[str, Any],
+        keys: List[str],
     ) -> None:
         """
-        Loads attributes from a Data_roicat object from a pickle file.
+        Returns a dictionary of the local variables with the specified keys.
 
         Args:
-            path_load (Union[str, Path]): 
-                Path to the pickle file.
-
-        Note: 
-            After calling this method, the attributes of this object are updated with those 
-            loaded from the pickle file. If an object in the pickle file is a dictionary, 
-            the object's attributes are set directly from the dictionary. Otherwise, if 
-            the object in the pickle file has a 'import_from_dict' method, it is used 
-            to load attributes. If it does not, the attributes are directly loaded from 
-            the object's `__dict__` attribute.
-
-        Example:
-            .. highlight:: python
-            .. code-block:: python
-
-                obj = Data_roicat()
-                obj.load('/path/to/pickle/file')
+            locals_dict (Dict[str, Any]): 
+                Dictionary of local variables.
+            keys (List[str]): 
+                List of keys to extract from the local variables.
         """
-        from pathlib import Path
-        assert Path(path_load).exists(), f"RH ERROR: File does not exist: {path_load}."
-        obj = helpers.pickle_load(path_load)
-        assert isinstance(obj, (type(self), dict)), f"RH ERROR: Loaded object is not a Data_roicat object or dictionary. Loaded object is of type {type(obj)}."
+        def safe_getitem(d, key):
+            try:
+                return d[key]
+            except KeyError:
+                warnings.warn(f'RH WARNING: key={key} not found in locals_dict. Skipping.')
 
-        if isinstance(obj, dict):
-            ## Set attributes from dict
-            ### If the subclass has a load_from_dict method, use that.
-            if hasattr(self, 'import_from_dict'):
-                self.import_from_dict(obj)
-            else:
-                for key, val in obj.items():
-                    setattr(self, key, val)
-        else:
-            ## Set attributes from object
-            for key, val in obj.__dict__.items():
-                setattr(self, key, val)
+        return {key: safe_getitem(locals_dict, key) for key in keys}
 
-        print(f"Loaded Data_roicat object from {path_load}.") if self._verbose else None
+
+class RichFile_ROICaT(rf.RichFile):
+    def __init__(
+        self,
+        path: Optional[Union[str, Path]] = None,
+        check: Optional[bool] = True,
+        safe_save: Optional[bool] = True,
+    ):
+        super().__init__(path=path, check=check, safe_save=safe_save)
+
+
+        ## NUMPY ARRAY
+        import numpy as np
+
+        def save_npy_array(
+            obj: np.ndarray,
+            path: Union[str, Path],
+            **kwargs,
+        ) -> None:
+            """
+            Saves a NumPy array to the given path.
+            """
+            np.save(path, obj, **kwargs)
+
+        def load_npy_array(
+            path: Union[str, Path],
+            **kwargs,
+        ) -> np.ndarray:
+            """
+            Loads an array from the given path.
+            """    
+            return np.load(path, **kwargs)
+        
+
+        ## SCIPY SPARSE MATRIX
+        import scipy.sparse
+
+        def save_sparse_array(
+            obj: scipy.sparse.spmatrix,
+            path: Union[str, Path],
+            **kwargs,
+        ) -> None:
+            """
+            Saves a SciPy sparse matrix to the given path.
+            """
+            scipy.sparse.save_npz(path, obj, **kwargs)
+
+        def load_sparse_array(
+            path: Union[str, Path],
+            **kwargs,
+        ) -> scipy.sparse.csr_matrix:
+            """
+            Loads a sparse array from the given path.
+            """        
+            return scipy.sparse.load_npz(path, **kwargs)
+        
+
+        ## JSON DICT
+        import collections
+        import json
+
+        def save_json_dict(
+            obj: collections.UserDict,
+            path: Union[str, Path],
+            **kwargs,
+        ) -> None:
+            """
+            Saves a dictionary to the given path.
+            """
+            with open(path, 'w') as f:
+                json.dump(dict(obj), f, **kwargs)
+
+        def load_json_dict(
+            path: Union[str, Path],
+            **kwargs,
+        ) -> collections.UserDict:
+            """
+            Loads a dictionary from the given path.
+            """
+            with open(path, 'r') as f:
+                return JSON_Dict(json.load(f, **kwargs))
+
+
+        ## JSON LIST   
+        def save_json_list(
+            obj: collections.UserList,
+            path: Union[str, Path],
+            **kwargs,
+        ) -> None:
+            """
+            Saves a list to the given path.
+            """
+            with open(path, 'w') as f:
+                json.dump(list(obj), f, **kwargs)
+
+        def load_json_list(
+            path: Union[str, Path],
+            **kwargs,
+        ) -> collections.UserList:
+            """
+            Loads a list from the given path.
+            """
+            with open(path, 'r') as f:
+                return JSON_List(json.load(f, **kwargs))
+            
+
+        ## OPTUNA STUDY
+        import optuna
+        import pickle
+
+        ## load and save functions for optuna study
+        def save_optuna_study(
+            obj: optuna.study.Study,
+            path: Union[str, Path],
+            **kwargs,
+        ) -> None:
+            """
+            Saves an Optuna study to the given path.
+            """
+            with open(path, 'wb') as f:
+                pickle.dump(obj, f, **kwargs)
+
+        def load_optuna_study(
+            path: Union[str, Path],
+            **kwargs,
+        ) -> optuna.study.Study:
+            """
+            Loads an Optuna study from the given path.
+            """
+            with open(path, 'rb') as f:
+                return pickle.load(f, **kwargs)
+            
+        
+        ## TORCH TENSOR
+        import torch
+
+        def save_torch_tensor(
+            obj: torch.Tensor,
+            path: Union[str, Path],
+            **kwargs,
+        ) -> None:
+            """
+            Saves a PyTorch tensor to the given path as a NumPy array.
+            """
+            np.save(path, obj.detach().cpu().numpy(), **kwargs)
+
+        def load_torch_tensor(
+            path: Union[str, Path],
+            **kwargs,
+        ) -> torch.Tensor:
+            """
+            Loads a PyTorch tensor from the given path.
+            """
+            return torch.from_numpy(np.load(path, **kwargs))
+
+
+        ## REPR
+        def save_repr(
+            obj: object,
+            path: Union[str, Path],
+            **kwargs,
+        ) -> None:
+            """
+            Saves the repr of an object to the given path.
+            """
+            with open(path, 'w') as f:
+                f.write(repr(obj))
+
+        def load_repr(
+            path: Union[str, Path],
+            **kwargs,
+        ) -> object:
+            """
+            Loads the repr of an object from the given path.
+            """
+            with open(path, 'r') as f:
+                return f.read()
+
+        import hdbscan
+
+        
+        ## PANDAS DATAFRAME
+        import pandas as pd
+        
+        def save_pandas_dataframe(
+            obj: pd.DataFrame,
+            path: Union[str, Path],
+            **kwargs,
+        ) -> None:
+            """
+            Saves a Pandas DataFrame to the given path.
+            """
+            ## Save as a CSV file
+            obj.to_csv(path, index=True, **kwargs)
+
+        def load_pandas_dataframe(
+            path: Union[str, Path],
+            **kwargs,
+        ) -> pd.DataFrame:
+            """
+            Loads a Pandas DataFrame from the given path.
+            """
+            ## Load as a CSV file
+            return pd.read_csv(path, index_col=0, **kwargs)
+
+        roicat_module_tds = [rf.functions.Container(
+            type_name=type_name,
+            object_class=object_class,
+            suffix="roicat",
+            library="roicat",
+            versions_supported=[">=1.1", "<2"],
+        ) for type_name, object_class in [
+            # ("data_suite2p", data_importing.Data_suite2p),
+            # ("data_caiman", data_importing.Data_caiman),
+            # ("data_roiextractors", data_importing.Data_roiextractors),
+            # ("data_roicat", data_importing.Data_roicat),
+            # ("aligner", alignment.Aligner),
+            # ("blurrer", blurring.ROI_Blurrer),
+            # ("roinet", ROInet.ROInet_embedder),
+            # ("swt", scatteringWaveletTransformer.SWT),
+            # ("similarity_graph", similarity_graph.ROI_graph),
+            # ("clusterer", clustering.Clusterer),
+
+            ("toeplitz_conv", helpers.Toeplitz_convolution2d),
+            ("convergence_checker_optuna", helpers.Convergence_checker_optuna),
+            ("image_alignment_checker", helpers.ImageAlignmentChecker),
+        ]]
+        # roicat_module_tds = []
+        
+
+        type_dicts = [
+            {
+                "type_name":          "numpy_array",
+                "function_load":      load_npy_array,
+                "function_save":      save_npy_array,
+                "object_class":       np.ndarray,
+                "suffix":             "npy",
+                "library":            "numpy",
+                "versions_supported": [],
+            },
+            {
+                "type_name":          "numpy_scalar",
+                "function_load":      load_npy_array,
+                "function_save":      save_npy_array,
+                "object_class":       np.number,
+                "suffix":             "npy",
+                "library":            "numpy",
+                "versions_supported": [],
+            },
+            {
+                "type_name":          "scipy_sparse_array",
+                "function_load":      load_sparse_array,
+                "function_save":      save_sparse_array,
+                "object_class":       scipy.sparse.spmatrix,
+                "suffix":             "npz",
+                "library":            "scipy",
+                "versions_supported": [],
+            },
+            {
+                "type_name":          "json_dict",
+                "function_load":      load_json_dict,
+                "function_save":      save_json_dict,
+                "object_class":       JSON_Dict,
+                "suffix":             "json",
+                "library":            "python",
+                "versions_supported": [],
+            },
+            {
+                "type_name":          "json_list",
+                "function_load":      load_json_list,
+                "function_save":      save_json_list,
+                "object_class":       JSON_List,
+                "suffix":             "json",
+                "library":            "python",
+                "versions_supported": [],
+            },
+            {
+                "type_name":          "optuna_study",
+                "function_load":      load_optuna_study,
+                "function_save":      save_optuna_study,
+                "object_class":       optuna.study.Study,
+                "suffix":             "optuna",
+                "library":            "optuna",
+                "versions_supported": [],
+            },
+            {
+                "type_name":          "torch_tensor",
+                "function_load":      load_torch_tensor,
+                "function_save":      save_torch_tensor,
+                "object_class":       torch.Tensor,
+                "suffix":             "npy",
+                "library":            "torch",
+                "versions_supported": [],
+            },
+            {
+                "type_name":          "model_swt",
+                "function_load":      load_repr,
+                "function_save":      save_repr,
+                "object_class":       Model_SWT,
+                "suffix":             "swt",
+                "library":            "onnx2torch",
+                "versions_supported": [],
+            },
+            {
+                "type_name":          "torch_module",
+                "function_load":      load_repr,
+                "function_save":      save_repr,
+                "object_class":       torch.nn.Module,
+                "suffix":             "torch_module",
+                "library":            "torch",
+                "versions_supported": [],
+            },
+            {
+                "type_name":          "torch_sequence",
+                "function_load":      load_repr,
+                "function_save":      save_repr,
+                "object_class":       torch.nn.Sequential,
+                "suffix":             "torch_sequence",
+                "library":            "torch",
+                "versions_supported": [],
+            },
+            {
+                "type_name":          "torch_dataset",
+                "function_load":      load_repr,
+                "function_save":      save_repr,
+                "object_class":       torch.utils.data.Dataset,
+                "suffix":             "torch_dataset",
+                "library":            "torch",
+                "versions_supported": [],
+            },
+            {
+                "type_name":          "torch_dataloader",
+                "function_load":      load_repr,
+                "function_save":      save_repr,
+                "object_class":       torch.utils.data.DataLoader,
+                "suffix":             "torch_dataloader",
+                "library":            "torch",
+                "versions_supported": [],
+            },
+            {
+                "type_name":          "hdbscan",
+                "function_load":      load_repr,
+                "function_save":      save_repr,
+                "object_class":       hdbscan.HDBSCAN,
+                "suffix":             "hdbscan",
+                "library":            "torch",
+                "versions_supported": [],
+            },
+            {
+                "type_name":          "pandas_dataframe",
+                "function_load":      load_pandas_dataframe,
+                "function_save":      save_pandas_dataframe,
+                "object_class":       pd.DataFrame,
+                "suffix":             "csv",
+                "library":            "pandas",
+                "versions_supported": [],
+            },
+        ] + [t.get_property_dict() for t in roicat_module_tds]
+
+        [self.register_type_from_dict(d) for d in type_dicts]
+        
+
+######################################
+######## CUSTOM DATA CLASSES #########
+######################################
+
+class JSON_Dict(dict):
+    def __init__(self, *args, **kwargs):
+        super(JSON_Dict, self).__init__(*args, **kwargs)
+class JSON_List(list):
+    def __init__(self, *args, **kwargs):
+        super(JSON_List, self).__init__(*args, **kwargs)
+
+## Wrapper for SWT
+class Model_SWT(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module):
+        super(Model_SWT, self).__init__()
+        self.add_module('model', model)
+    def forward(self, x):
+        return self.model(x)
 
 
 def make_session_bool(n_roi: np.ndarray,) -> np.ndarray:
@@ -679,6 +1142,26 @@ def make_session_bool(n_roi: np.ndarray,) -> np.ndarray:
     session_bool = np.vstack([(b_lower <= r) * (r < b_upper) for b_lower, b_upper in zip(n_roi_cumsum[:-1], n_roi_cumsum[1:])]).T
     return session_bool
 
+
+def split_iby_session(
+    x: Any,
+    n_roi_per_session: Union[np.ndarray, List[int]],
+):
+    """
+    Splits an array or iterable into a list of arrays or iterables based on the
+    number of ROIs per session.
+
+    Args:
+        arr (Any): 
+            Array to split.
+        n_roi_per_session (Union[np.ndarray, List[int]]): 
+            Number of ROIs per session.
+
+    Returns:
+        (List[Any]): 
+            List of arrays split by session.
+    """
+    return [x[sum(n_roi_per_session[:ii]):sum(n_roi_per_session[:ii+1])] for ii in range(len(n_roi_per_session))]
 
 ##########################################################################################################################
 ############################################### UCID handling ############################################################
@@ -799,9 +1282,15 @@ def mask_UCIDs_with_iscell(
 
     Args:
         ucids (List[Union[List[int], np.ndarray]]): 
-            List of lists of UCIDs for each session.
+            List of lists of UCIDs for each session.\n
+            Shape outer list: *(n_sessions,)*\n
+            Shape inner list: *(n_roi_in_session,)*
         iscell (List[Union[List[bool], np.ndarray]]): 
-            List of lists of boolean indicators for each UCID. 
+            List of lists of boolean indicators for each UCID.\n
+            ``True`` means that ROI is a cell, ``False`` means that ROI is not a
+            cell.\n
+            Shape outer list: *(n_sessions,)*\n
+            Shape inner list: *(n_roi_in_session,)*
 
     Returns:
         (List[Union[List[int], np.ndarray]]): 
@@ -827,6 +1316,54 @@ def mask_UCIDs_with_iscell(
     for i_sesh in range(n_sesh):
         ucids_out[i_sesh][~iscell[i_sesh]] = -1
     
+    return ucids_out
+
+
+def mask_UCIDs_by_label(
+    ucids: List[Union[List[int], np.ndarray]],
+    labels: Union[List[int], np.ndarray],
+) -> List[Union[List[int], np.ndarray]]:
+    """
+    Sets labels in the UCIDs to -1 if they are not present in the **labels**
+    array.\n
+    RH 2024
+
+    Args:
+        ucids (List[Union[List[int], np.ndarray]]): 
+            List of lists of UCIDs for each session.\n
+            Shape outer list: *(n_sessions,)*\n
+            Shape inner list: *(n_roi_in_session,)*
+        labels (Union[List[int], np.ndarray]): 
+            Array of labels to keep. All other labels are set to -1.
+            Shape: *(n_labels,)*
+
+    Returns:
+        (List[Union[List[int], np.ndarray]]): 
+            ucids_out (List[Union[List[int], np.ndarray]]): 
+                Masked list of lists of UCIDs. Elements that are not in the
+                **labels** array are set to -1 in each session.
+
+    Example:
+        .. highlight:: python
+        .. code-block:: python
+
+        ucids = [[1, 2, 3], [2, -1, 4], [3, 0, 5]]
+        labels = [2, 3]
+        ucids_out = mask_UCIDs_by_label(ucids, labels)
+        # ucids_out = [[-1, 2, 3], [2, -1, -1], [3, -1, -1]]
+    """
+    ucids_out = copy.deepcopy(ucids)
+    ucids_out = check_dataStructure__list_ofListOrArray_ofDtype(
+        lolod=ucids_out,
+        dtype=np.int64,
+        fix=True,
+        verbose=False,
+    )
+    labels = np.array(labels, dtype=np.int64)
+
+    iscell = [np.isin(u_sesh, labels) for u_sesh in ucids_out]
+    ucids_out = mask_UCIDs_with_iscell(ucids_out, iscell)
+
     return ucids_out
 
 
@@ -879,7 +1416,8 @@ def discard_UCIDs_with_fewer_matches(
     
 
 def squeeze_UCID_labels(
-    ucids: List[Union[List[int], np.ndarray]]
+    ucids: List[Union[List[int], np.ndarray]],
+    return_array: bool = False,
 ) -> List[Union[List[int], np.ndarray]]:
     """
     Squeezes the UCID labels. Finds all the unique UCIDs across all sessions,
@@ -890,6 +1428,9 @@ def squeeze_UCID_labels(
     Args:
         ucids (List[Union[List[int], np.ndarray]]): 
             List of lists of UCIDs for each session.
+        return_array (bool):
+            If ``True``, then the output will be a numpy array.
+            (Default is ``False``)
 
     Returns:
         (List[Union[List[int], np.ndarray]]): 
@@ -916,14 +1457,19 @@ def squeeze_UCID_labels(
     for i_sesh in range(n_sesh):
         ucids_out[i_sesh] = [int(mapping[val]) for val in ucids_out[i_sesh]]
 
-    return ucids_out
+    if not return_array:
+        return ucids_out
+    else:
+        return [np.array(u) for u in ucids_out]
 
 
 def match_arrays_with_ucids(
     arrays: Union[np.ndarray, List[np.ndarray]], 
     ucids: Union[List[np.ndarray], List[List[int]]], 
+    return_indices: bool = False,
     squeeze: bool = False,
     force_sparse: bool = False,
+    prog_bar: bool = False,
 ) -> List[Union[np.ndarray, scipy.sparse.lil_matrix]]:
     """
     Matches the indices of the arrays using the UCIDs. Array indices with UCIDs
@@ -936,9 +1482,19 @@ def match_arrays_with_ucids(
             first dimension.
         ucids (Union[List[np.ndarray], List[List[int]]]): 
             List of lists of UCIDs for each session.
+        return_indices (bool):
+            If ``True``, then the indices of the UCIDs will also be returned.
+            The indices will be of dtype np.float32 because it may contain NaNs.
+            (Default is ``False``)
         squeeze (bool): 
             If ``True``, then UCIDs are squeezed to be contiguous integers.
             (Default is ``False``)
+        force_sparse (bool):
+            If ``True``, then the output will be a list of sparse matrices.
+            (Default is ``False``)
+        prog_bar (bool):
+            If ``True``, then a progress bar will be displayed. (Default is
+            ``False``)
 
     Returns:
         (List[Union[np.ndarray, scipy.sparse.lil_matrix]]): 
@@ -959,6 +1515,10 @@ def match_arrays_with_ucids(
         fix=True,
         verbose=False,
     )
+    ## Error if dtype is not NaN compatible
+    if not np.issubdtype(arrays[0].dtype, np.floating):
+        raise ValueError(f'ROICaT ERROR: This function requires inputs to be of a dtype that is compatible with NaNs, like np.floating types: np.float32, np.float64, etc.')
+    ## Squeeze UCIDs
     ucids_tu = squeeze_UCID_labels(ucids_tu) if squeeze else ucids_tu
     # max_ucid = (np.unique(np.concatenate(ucids_tu, axis=0)) >= 0).max()
     max_ucid = (np.unique(np.concatenate(ucids_tu, axis=0))).max().astype(int) + 1
@@ -974,12 +1534,22 @@ def match_arrays_with_ucids(
         raise ValueError(f'ROICaT ERROR: arrays[0] is not a numpy array or scipy.sparse matrix.')
     ## fill in the arrays with the data
     n_sesh = len(arrays)
-    for i_sesh in range(n_sesh):
+    for i_sesh in tqdm(range(n_sesh), disable=not prog_bar):
         for u, idx in dicts_ucids[i_sesh].items():
             if u >= 0:
                 arrays_out[i_sesh][u] = arrays[i_sesh][idx]
 
-    return arrays_out
+    if not return_indices:
+        return arrays_out
+    else:
+        return arrays_out, match_arrays_with_ucids(
+            arrays=[np.arange(len(a), dtype=np.float32) for a in arrays],
+            ucids=ucids,
+            return_indices=False,
+            squeeze=squeeze,
+            force_sparse=False,
+            prog_bar=False,
+        )
 
 def match_arrays_with_ucids_inverse(
     arrays: Union[np.ndarray, List[np.ndarray]], 
@@ -1052,3 +1622,31 @@ def match_arrays_with_ucids_inverse(
     
     return arrays_inv
     
+
+def labels_to_labelsBySession(labels, n_roi_bySession):
+    """
+    Converts a list of labels to a list of lists of labels by session.
+    RH 2024
+
+    Args:
+        labels (list or np.ndarray): 
+            List of labels.
+        n_roi_bySession (list or np.ndarray): 
+            Number of ROIs by session.
+
+    Returns:
+        (list): 
+            List of lists of labels by session.
+    """
+    assert isinstance(labels, (list, np.ndarray)), f'labels is not a list or np.ndarray. labels={labels}'
+    assert isinstance(n_roi_bySession, (list, np.ndarray)), f'n_roi_bySession is not a list or np.ndarray. n_roi_bySession={n_roi_bySession}'
+    labels = np.array(labels)
+    n_roi_bySession = np.array(n_roi_bySession, dtype=np.int64)
+    assert labels.ndim == 1, f'labels.ndim={labels.ndim}, but should be 1.'
+    assert n_roi_bySession.ndim == 1, f'n_roi_bySession.ndim={n_roi_bySession.ndim}, but should be 1.'
+
+    assert np.sum(n_roi_bySession) == len(labels), f'np.sum(n_roi_bySession)={np.sum(n_roi_bySession)} != len(labels)={len(labels)}'
+
+    labels_bySession = split_iby_session(x=labels, n_roi_per_session=n_roi_bySession)
+
+    return labels_bySession

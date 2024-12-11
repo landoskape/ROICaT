@@ -76,7 +76,7 @@ class Data_roicat(util.ROICaT_Module):
             numpy array (first dimension) is an ROI.
         spatialFootprints (List[object]): 
             A list of scipy.sparse.csr_matrix objects, each with shape *(n_roi,
-            FOV_height*FOV_width)*. Each element represents an imaging session.
+            FOV_height \* FOV_width)*. Each element represents an imaging session.
         class_labels_raw (List[np.ndarray]): 
             A list of numpy arrays, each with shape *(n_roi,)*, where each
             element is an integer. Each element of the list is an imaging
@@ -86,10 +86,11 @@ class Data_roicat(util.ROICaT_Module):
             element is an integer. Each element of the list is an imaging
             session and each element of the numpy array is the index of the
             class label obtained from passing the raw class label through
-            np.unique(*, return_inverse=True).
-        um_per_pixel (float): 
+            np.unique(\*, return_inverse=True).
+        um_per_pixel (Union[float, List[float]]):
             The conversion factor from pixels to microns. This is used to scale
-            the ROI_images to a common size.
+            the ROI_images to a common size. Should either be a float or a list
+            of floats, one for each session.
         session_bool (np.ndarray): 
             A boolean matrix with shape *(n_roi_total, n_sessions)*. Each
             element is ``True`` if the ROI is present in the session.
@@ -106,8 +107,6 @@ class Data_roicat(util.ROICaT_Module):
 
         self._verbose = verbose
     
-        self.type = type(self)  ## Overwrites the superclass attribute self.type
-
     #########################################################
     ################# CLASSIFICATION ########################
     #########################################################
@@ -115,7 +114,7 @@ class Data_roicat(util.ROICaT_Module):
     def set_ROI_images(
         self,
         ROI_images: List[np.ndarray],
-        um_per_pixel: Optional[float] = None,
+        um_per_pixel: Optional[List[float]] = None,
     ) -> None:
         """
         Imports ROI images into the class. Images are expected to be formatted
@@ -129,34 +128,33 @@ class Data_roicat(util.ROICaT_Module):
             ROI_images (List[np.ndarray]): 
                 List of numpy arrays each of shape *(n_roi, FOV_height,
                 FOV_width)*.
-            um_per_pixel (Optional[float]): 
-                The number of microns per pixel. This is used to resize the
-                images to a common size. (Default is ``None``)
+            um_per_pixel (Union[float, List[float]]):
+                The conversion factor from pixels to microns. This is used to scale
+                the ROI_images to a common size. Should either be a float or a list
+                of floats, one for each session.
         """
+        ## Store parameter (but not data) args as attributes
+        self.params['set_ROI_images'] = self._locals_to_params(
+            locals_dict=locals(),
+            keys=[
+                'um_per_pixel',
+            ],
+        )
+
+        print(f"Starting: Importing ROI images") if self._verbose else None
+
+        ## Check the validity of the inputs
+        ROI_images = self._fix_ROI_images(ROI_images=ROI_images)
+
         ## Warn if no um_per_pixel is provided
         if um_per_pixel is None:
             ## Check if it is already set
             if hasattr(self, 'um_per_pixel'):
                 um_per_pixel = self.um_per_pixel
-            warnings.warn("RH WARNING: No um_per_pixel provided. We recommend making an educated guess. Assuming 1.0 um per pixel. This will affect the embedding results.")
-            um_per_pixel = 1.0
+            warnings.warn("RH WARNING: No um_per_pixel provided. We recommend making an educated guess. Assuming 1.0 um per pixel for each session. This will affect the embedding results.")
+            um_per_pixel = [1.0,] * len(ROI_images)
 
-        print(f"Starting: Importing ROI images") if self._verbose else None
-
-        ## Check the validity of the inputs
-        ### Check ROI_images
-        if isinstance(ROI_images, np.ndarray):
-            print("RH WARNING: ROI_images is a numpy array. Assuming n_sessions==1 and wrapping array in a list.")
-            ROI_images = [ROI_images]
-        assert isinstance(ROI_images, list), f"ROI_images should be a list. It is a {type(ROI_images)}"
-        assert all([isinstance(roi, np.ndarray) for roi in ROI_images]), f"ROI_images should be a list of numpy arrays. First element of list is of type {type(ROI_images[0])}"
-        assert all([roi.ndim==3 for roi in ROI_images]), f"ROI_images should be a list of numpy arrays of shape (n_roi, FOV_height, FOV_width). First element of list is of shape {ROI_images[0].shape}"
-        ### Assert that all the FOV heights and widths are the same
-        assert all([roi.shape[1]==ROI_images[0].shape[1] for roi in ROI_images]), f"All the FOV heights should be the same. First element of list is of shape {ROI_images[0].shape}"
-        assert all([roi.shape[2]==ROI_images[0].shape[2] for roi in ROI_images]), f"All the FOV widths should be the same. First element of list is of shape {ROI_images[0].shape}"
-
-        self._check_um_per_pixel(um_per_pixel)
-        um_per_pixel = float(um_per_pixel)
+        um_per_pixel = self._fix_um_per_pixel(um_per_pixel=um_per_pixel, n_sessions=len(ROI_images))
             
         ## Define some variables
         n_sessions = len(ROI_images)
@@ -182,98 +180,92 @@ class Data_roicat(util.ROICaT_Module):
 
     def set_class_labels(
         self,
-        labels: Optional[Union[List[np.ndarray], np.ndarray]] = None,
+        labels: Optional[List[Union[np.ndarray, List[Union[int, str, float]]]]] = None,
         path_labels: Optional[Union[str, List[str]]] = None,
         n_classes: Optional[int] = None,
     ) -> None:
         """
         Imports class labels into the class. 
 
-        * labels are expected to be formatted as a list of numpy arrays or
-          strings. Each element in the list is a session, and each element in
-          the numpy array is associated with the nth element of the
-          self.ROI_images list. Each element is a numpy array of shape
-          *(n_roi,)*.
-
-        * Sets the attributes: self.class_labels_raw, self.class_labels_index,
-          self.n_classes, self.n_class_labels, self.n_class_labels_total,
-          self.unique_class_labels. If any of these attributes are already set,
-          they will verify the new values match the existing ones.
+        * labels are expected to be formatted as a list of arrays. The outer
+          list should have length equal to the number of sessions (n_sessions).
+          Each element in the list is either a 1D array or list of integers or
+          strings and should have length equal to the number of ROIs in that
+          session (n_roi). Each element in the array or list is the class label
+          for the corresponding ROI and can be a number or a string.
+          List[Union[np.ndarray, List[Union[int, str, float]]]]. \n
 
         Args:
-            labels (Optional[Union[List[np.ndarray], np.ndarray]]): \n
+            labels (Optional[List[Union[np.ndarray, List[Union[int, str, float]]]]]): \n
                 * If ``None``: path_labels must be specified. 
-                * If a ``list`` of ``np.ndarray``: each element should be a 1D
-                  array of integers or strings of length *n_roi* specifying the
-                  class label for each ROI. \n
-                (Default is ``None``)
+                * Else: ``labels`` are expected to be a list of arrays. The
+                  outer list should have length equal to the number of sessions
+                  (``n_sessions``). Each element in the list is either a 1D
+                  array or list of integers or strings and should have length
+                  equal to the number of ROIs in that session (``n_roi``). Each
+                  element in the array or list is the class label for the
+                  corresponding ROI and can be a number or a string. 
+                  List[Union[np.ndarray, List[Union[int, str, float]]]]. \n
             path_labels (Optional[Union[str, List[str]]]): \n
                 * If ``None``: labels must be specified.
-                * If a ``list`` of ``str``: each element should be a path to a
-                  either: \n
-                    * A ``.npy`` file containing a numpy array of shape
-                      *(n_roi,)* OR
-                    * A ``.pkl`` or ``.npy`` file containing a dictionary with
-                      an item that has key 'labels' and value of a numpy
-                      array of shape *(n_roi,)*.  \n
-                The numpy array should be of integers or strings specifying the
-                class label
+                * Else: ``path_labels`` is expected to be a list of strings. Each
+                  element in the list is a path to a file containing the class
+                  labels. The outer list should have length equal to
+                  the number of sessions (``n_sessions``). Each file should be a
+                  json file containing a list of integers or strings corresponding
+                  to the class labels for each ROI in that session.
 
             n_classes (Optional[int]): 
                 Number of classes. If not provided, it will be inferred from the
                 class labels. (Default is ``None``)
         """
+        ## Store parameter (but not data) args as attributes
+        self.params['set_class_labels'] = self._locals_to_params(
+            locals_dict=locals(),
+            keys=[
+                'path_labels',
+                'n_classes',
+            ],
+        )
+
         print(f"Starting: Importing class labels") if self._verbose else None
 
-        if path_labels is not None:
-            assert labels is None, f"labels is not None but path_labels is not None. Please specify only one of them."
-            ## Convert to a list if it is not already
-            if isinstance(path_labels, list) == False:
-                print(f'Input labels is not a list. Wrapping it in a list.') if self._verbose else None
-                path_labels =[path_labels]
-            ## Assert that all the elements are strings
+        ## Check inputs
+        if labels is not None:
+            assert isinstance(labels, list), f"labels should be a list. It is a {type(labels)}"
+            ## make sure all elements are numpy arrays or lists
+            assert all([isinstance(l, (np.ndarray, list)) for l in labels]), f"labels should be a list of numpy arrays or lists of integers or strings. First element of list is of type {type(labels[0])}"
+            ## convert lists to numpy arrays
+            labels_raw = [np.array(l, dtype=str) if isinstance(l, list) else l for l in labels]
+            ## make sure all elements are 1D
+            assert all([l.ndim==1 for l in labels_raw]), f"labels should be a list of 1D numpy arrays or lists of integers or strings. First element of list is of shape {labels[0].shape}"
+        elif path_labels is not None:
+            ## It should be a csv file (or list of files) with the first column as the index and second column as the class label
+            assert isinstance(path_labels, (str, list)), f"path_labels should be a string or a list of strings. It is a {type(path_labels)}"
+            if isinstance(path_labels, str):
+                path_labels = [path_labels]
+            ## make sure all elements are strings
             assert all([isinstance(l, str) for l in path_labels]), f"path_labels should be a list of strings. First element of list is of type {type(path_labels[0])}"
-            ## Check the file extension
-            extension = Path(path_labels[0]).suffix
-            ## Load the labels
-            if extension == '.npy':
-                self.class_labels_raw = [np.load(p, allow_pickle=True)[()] for p in path_labels]
-            elif extension == '.pkl':
-                self.class_labels_raw = [helpers.pickle_load(p) for p in path_labels]
-            else:
-                raise ValueError(f"File extension {extension} is not supported. Please use either .npy or .pkl")
-            ## Check that if the inputs are dictionaries, we extract the labels
-            if isinstance(self.class_labels_raw[0], dict):
-                assert all(['labels' in l for l in self.class_labels_raw]), f"Found a dictionary in the .npy file. The dictionary should have a key 'labels' with a value of a numpy array of shape (n_roi,)."
-                self.class_labels_raw = [l['labels'] for l in self.class_labels_raw]
+            ## make sure all files exist
+            assert all([Path(l).exists() for l in path_labels]), f"Files in path_labels do not exist. Please check the paths."
+            ## make sure all files are json files containing lists of integers or strings or floats
+            assert all([Path(l).suffix in ['.json',] for l in path_labels]), f"Files in path_labels should be json files. Please check the file extensions."
+            ## load the files
+            labels_raw = [np.array(helpers.json_load(l), dtype=str) for l in path_labels]
         else:
-            assert labels is not None, f"Either labels or path_labels must be specified."
-            assert isinstance(labels, str) == False, f"labels is a string. Did you mean to specify path_labels?"
-            self.class_labels_raw = labels
-
-        ## Convert to a list if it is not already
-        if isinstance(self.class_labels_raw, list) == False:
-            print(f'Input labels is not a list. Wrapping it in a list.') if self._verbose else None
-            self.class_labels_raw = [self.class_labels_raw]
-        ## Assert that all the elements are numpy arrays
-        assert all([isinstance(l, np.ndarray) for l in self.class_labels_raw]), f"labels should be a list of numpy arrays. First element of list is of type {type(self.class_labels_raw[0])}"
-        ## Assert that all the elements are 1D
-        assert all([l.ndim==1 for l in self.class_labels_raw]), f"labels should be a list of 1D numpy arrays. First element of list is of shape {self.class_labels_raw[0].shape}"
-
-        ## Define some variables
-        n_sessions = len(self.class_labels_raw)
-        labels_cat = np.concatenate(self.class_labels_raw, axis=0)
-        labels_cat_squeezeInt = np.unique(labels_cat, return_inverse=True)[1].astype(np.int64)
-        unique_class_labels = np.unique(labels_cat)
-        if n_classes is not None:
-            assert len(unique_class_labels) <= n_classes, f"RH ERROR: User provided n_classes={n_classes} but there are {len(unique_class_labels)} unique class labels in the provided class_labels." if self._verbose else None
-        else:
-            n_classes = len(unique_class_labels)
-        n_class_labels = [lbls.shape[0] for lbls in self.class_labels_raw]
+            raise ValueError(f"Either labels or path_labels must be specified.")
+        
+        ## convert lists to numpy arrays of unique integers
+        labels_cat = np.concatenate(labels_raw, axis=0)
+        unique_class_labels, labels_cat_squeezeInt = np.unique(labels_cat, return_inverse=True)
+        n_classes = len(unique_class_labels)
+        n_class_labels = [lbls.shape[0] for lbls in labels_raw]
         n_class_labels_total = sum(n_class_labels)
-        class_labels_squeezeInt = [labels_cat_squeezeInt[sum(n_class_labels[:ii]):sum(n_class_labels[:ii+1])] for ii in range(n_sessions)]
+        n_sessions = len(labels_raw)
+        class_labels_squeezeInt = util.labels_to_labelsBySession(labels=labels_cat_squeezeInt, n_roi_bySession=n_class_labels)
 
         ## Set attributes
+        self.class_labels_raw = labels_raw
         self.class_labels_index = class_labels_squeezeInt
         self.n_classes = n_classes
         self.n_class_labels = n_class_labels
@@ -285,16 +277,39 @@ class Data_roicat(util.ROICaT_Module):
 
         print(f"Completed: Imported labels for {n_sessions} sessions. Each session has {n_class_labels} class labels. Total number of class labels is {n_class_labels_total}.") if self._verbose else None
 
-    def _check_um_per_pixel(self, um_per_pixel: float,) -> None:
-        """
-        Checks whether um_per_pixel is of appropriate type and is positive.
+    @classmethod
+    def _fix_um_per_pixel(
+        cls,
+        um_per_pixel: Union[float, List[float]],
+        n_sessions: int,
+    ) -> List[float]:
+        if isinstance(um_per_pixel, float):
+            um_per_pixel = [um_per_pixel,] * n_sessions
+        elif isinstance(um_per_pixel, list):
+            assert all([isinstance(ump, float) for ump in um_per_pixel]), f"um_per_pixel should be a float or a list of floats. First element of list is of type {type(um_per_pixel[0])}"
+            um_per_pixel = [float(ump) for ump in um_per_pixel]
+        else:
+            raise ValueError(f"um_per_pixel should be a float or a list of floats. It is a {type(um_per_pixel)}")
+        assert len(um_per_pixel) == n_sessions, f"um_per_pixel should be a float or a list of floats of length equal to the number of sessions. It is of length {len(um_per_pixel)} and there are {n_sessions} sessions."
+        
+        return um_per_pixel
+    
+    @classmethod
+    def _fix_ROI_images(
+        cls,
+        ROI_images: List[np.ndarray],
+    ) -> List[np.ndarray]:
+        ### Check ROI_images
+        if isinstance(ROI_images, np.ndarray):
+            print("RH WARNING: ROI_images is a numpy array. Assuming n_sessions==1 and wrapping array in a list.")
+            ROI_images = [ROI_images,]
+        assert isinstance(ROI_images, list), f"ROI_images should be a list. It is a {type(ROI_images)}"
+        assert all([isinstance(roi, np.ndarray) for roi in ROI_images]), f"ROI_images should be a list of numpy arrays. First element of list is of type {type(ROI_images[0])}"
+        assert all([roi.ndim==3 for roi in ROI_images]), f"ROI_images should be a list of numpy arrays of shape (n_roi, height, width). First element of list is of shape {ROI_images[0].shape}"
+        ### Assert that all the ROI heights and widths are the same
+        assert all([tuple(roi.shape[1:]) == tuple(ROI_images[0].shape[1:]) for roi in ROI_images]), f"ROI_images should be a list of numpy arrays of shape (n_roi, height, width). All elements should have the same height and width as the first element."
 
-        Args:
-            um_per_pixel (float):
-                The number of microns per pixel.
-        """
-        assert isinstance(um_per_pixel, (int, float)), f"um_per_pixel should be a float. It is a {type(um_per_pixel)}"
-        assert um_per_pixel > 0, f"um_per_pixel should be a positive number. It is {um_per_pixel}"
+        return ROI_images
 
     def _checkValidity_classLabels_vs_ROIImages(
         self, 
@@ -334,7 +349,7 @@ class Data_roicat(util.ROICaT_Module):
     def set_spatialFootprints(
         self,
         spatialFootprints: List[Union[np.ndarray, scipy.sparse.csr_matrix, Dict[str, Any]]],
-        um_per_pixel: Optional[float] = None,
+        um_per_pixel: Optional[Union[float, List[float]]] = None,
     ):
         """
         Sets the **spatialFootprints** attribute.
@@ -352,18 +367,18 @@ class Data_roicat(util.ROICaT_Module):
                   should be a serialized **scipy.sparse.csr_matrix** object. It
                   should contains keys: 'data', 'indices', 'indptr', 'shape'.
                   See **scipy.sparse.csr_matrix** for more information.
-            um_per_pixel (Optional[float]): 
-                The number of microns per pixel. This is used to resize the
-                images to a common size. (Default is ``None``)
+            um_per_pixel (Union[float, List[float]]):
+                The conversion factor from pixels to microns. This is used to scale
+                the ROI_images to a common size. Should either be a float or a list
+                of floats, one for each session.
         """
-        ## Warn if no um_per_pixel is provided
-        if um_per_pixel is None:
-            ## Check if it is already set
-            if hasattr(self, 'um_per_pixel'):
-                um_per_pixel = self.um_per_pixel
-            else:
-                warnings.warn("RH WARNING: No um_per_pixel provided. We recommend making an educated guess. Assuming 1.0 um per pixel. This will affect the embedding results.")
-                um_per_pixel = 1.0
+        ## Store parameter (but not data) args as attributes
+        self.params['set_spatialFootprints'] = self._locals_to_params(
+            locals_dict=locals(),
+            keys=[
+                'um_per_pixel',
+            ],
+        )
 
         ## Check inputs
         if isinstance(spatialFootprints, list)==False:
@@ -384,8 +399,16 @@ class Data_roicat(util.ROICaT_Module):
         else:
             raise ValueError(f"spatialFootprints should be a list of numpy.ndarray objects, scipy.sparse.csr_matrix objects, or dictionaries of csr_matrix input arguments (see documentation). Found elements of type: {type(spatialFootprints[0])}")
 
-        self._check_um_per_pixel(um_per_pixel)
-        um_per_pixel = float(um_per_pixel)
+        ## Warn if no um_per_pixel is provided
+        if um_per_pixel is None:
+            ## Check if it is already set
+            if hasattr(self, 'um_per_pixel'):
+                um_per_pixel = self.um_per_pixel
+            else:
+                warnings.warn("RH WARNING: No um_per_pixel provided. We recommend making an educated guess. Assuming 1.0 um per pixel. This will affect the embedding results.")
+                um_per_pixel = [1.0,] * len(sf_all)
+
+        um_per_pixel = self._fix_um_per_pixel(um_per_pixel=um_per_pixel, n_sessions=len(sf_all))
 
         ## Get some variables
         n_sessions = len(sf_all)
@@ -423,6 +446,9 @@ class Data_roicat(util.ROICaT_Module):
                 List of 2D **numpy.ndarray** objects, one for each session. Each
                 array should have shape *(FOV_height, FOV_width)*.
         """
+        ## Store parameter (but not data) args as attributes
+        ### Nothing to store        
+
         if isinstance(FOV_images, np.ndarray):
             assert FOV_images.ndim == 3, f"RH ERROR: FOV_images must be a list of 2D numpy arrays."
             FOV_images = [fov for fov in FOV_images]
@@ -434,6 +460,7 @@ class Data_roicat(util.ROICaT_Module):
         assert all([img.shape[1] == FOV_images[0].shape[1] for img in FOV_images]), f"RH ERROR: All elements in FOV_images must have the same height and width."
 
         ## Set attributes
+        print("Setting FOV_images...") if self._verbose else None
         self.FOV_images = [np.array(f, dtype=np.float32) for f in FOV_images]
         self.FOV_height = int(FOV_images[0].shape[0])
         self.FOV_width = int(FOV_images[0].shape[1])
@@ -462,6 +489,15 @@ class Data_roicat(util.ROICaT_Module):
             FOV_width (int): 
                 The width of the field of view (FOV) in pixels.
         """
+        ## Store parameter (but not data) args as attributes
+        self.params['set_FOVHeightWidth'] = self._locals_to_params(
+            locals_dict=locals(),
+            keys=[
+                'FOV_height',
+                'FOV_width',
+            ],
+        )
+
         ## Check inputs
         assert isinstance(FOV_height, int), f"RH ERROR: FOV_height must be an integer."
         assert isinstance(FOV_width, int), f"RH ERROR: FOV_width must be an integer."
@@ -668,7 +704,7 @@ class Data_roicat(util.ROICaT_Module):
         print(f"Completed: Created centroids.") if self._verbose else None
 
     
-    def _transform_spatialFootprints_to_ROIImages(
+    def transform_spatialFootprints_to_ROIImages(
         self, 
         out_height_width: Tuple[int, int] = (36, 36)
     ) -> np.ndarray:
@@ -699,34 +735,167 @@ class Data_roicat(util.ROICaT_Module):
 
         ## Make helper function
         def sf_to_centeredROIs(sf, centroids):
-            half_widths = np.ceil(np.array(out_height_width)/2).astype(int)
-            sf_rs = sparse.COO(sf).reshape((sf.shape[0], self.FOV_height, self.FOV_width))
+            ## Check if any ROI image has violations: all zero, has NaNs
+            sf_sum = sf.sum(1)
+            if np.any(sf_sum==0):
+                warnings.warn(f"RH WARNING: Found ROIs with all zero spatial footprints. Setting them to zero. This will affect the embedding results. Indices with all zero: {np.where(sf_sum==0)[0]}")
+            if np.any(np.isnan(sf_sum)):
+                warnings.warn(f"RH WARNING: Found NaNs in the sum of the spatial footprints. Setting them to zero. This will affect the embedding results. Indices with NaN: {np.where(np.isnan(sf_sum))[0]}")
+                sf.data = np.nan_to_num(sf.data)
+            
+            half_widths = np.ceil(np.array(out_height_width)/2).astype(int)    
+            sf_rs_centered = sparse.COO(sf).reshape((sf.shape[0], self.FOV_height, self.FOV_width))  ## shape: (n_roi, FOV_height, FOV_width)
 
-            coords_diff = np.diff(sf_rs.coords[0])
-            assert np.all(coords_diff < 1.01) and np.all(coords_diff > -0.01), \
-                "RH ERROR: sparse.COO object has strange .coords attribute. sf_rs.coords[0] should all be 0 or 1. An ROI is possibly all zeros."
-            
-            idx_split = (sf_rs>0).astype(np.bool_).sum((1,2)).todense().cumsum()[:-1]
-            coords_split = [np.split(sf_rs.coords[ii], idx_split) for ii in [0,1,2]]
-            coords_split[1] = [coords - centroids[0][ii] + half_widths[0] for ii,coords in enumerate(coords_split[1])]
-            coords_split[2] = [coords - centroids[1][ii] + half_widths[1] for ii,coords in enumerate(coords_split[2])]
-            sf_rs_centered = sf_rs.copy()
-            sf_rs_centered.coords = np.array([np.concatenate(c) for c in coords_split])
-            sf_rs_centered = sf_rs_centered[:, :out_height_width[0], :out_height_width[1]]
-            return sf_rs_centered.todense().astype(np.float32)
-            
+            ## Shift coords to be centered on centroids
+            sf_rs_centered.coords[1:3] = sf_rs_centered.coords[1:3] - (centroids[sf_rs_centered.coords[0]].T - half_widths[:, None])
+            ## Set values with coords outside of out_height_width to 0
+            sf_rs_centered.data[(sf_rs_centered.coords[1:3] < 0).any(axis=0) | (sf_rs_centered.coords[1] >= out_height_width[0]) | (sf_rs_centered.coords[2] >= out_height_width[1])] = 0
+            ## Clip coords to within out_height_width
+            sf_rs_centered.coords[1] = np.clip(sf_rs_centered.coords[1], 0, out_height_width[0]-1)
+            sf_rs_centered.coords[2] = np.clip(sf_rs_centered.coords[2], 0, out_height_width[1]-1)
+            ## Crop to out_height_width
+            sf_rs_centered = sf_rs_centered[:, 0:out_height_width[0], 0:out_height_width[1]]
+            ## Cast and densify
+            return sf_rs_centered.astype(np.float32).todense()
+
         ## Transform
-        print(f"Staring: Creating centered ROI images from spatial footprints...") if self._verbose else None
-        self.ROI_images = [sf_to_centeredROIs(sf, centroids.T) for sf, centroids in zip(self.spatialFootprints, self.centroids)]
+        print(f"Starting: Creating centered ROI images from spatial footprints...") if self._verbose else None
+        self.ROI_images = [sf_to_centeredROIs(sf.copy(), centroids) for sf, centroids in zip(self.spatialFootprints, self.centroids)]
         print(f"Completed: Created ROI images.") if self._verbose else None
 
         return self.ROI_images
         
+    def remove_rois_by_classLabel(
+        self,
+        classLabel_to_keep:   Optional[Union[int, List[int]]] = None,
+        classLabel_to_remove: Optional[Union[int, List[int]]] = None,
+        in_place: bool = True,
+        verbose: Optional[bool] = None,
+    ):
+        """
+        Removes ROIs based on their class label. Remakes all attributes that are
+        affected by the removal of
+        ROIs. This includes:
+            * spatialFootprints
+            * ROI_images
+            * centroids
+            * class_labels_raw
+            * class_labels_index
+            * session_bool
+            * all attributes related to above attributes
 
+        Args:
+            classLabel_to_keep (Optional[Union[int, List[int]]]):
+                Class label(s) to keep. If ``None``, ``classLabel_to_remove``
+                must be provided. The values should correspond to the values
+                seen in the ``self.class_labels_raw`` attribute.
+            classLabel_to_remove (Optional[Union[int, List[int]]]):
+                Class label(s) to remove. If ``None``, ``classLabel_to_keep`` must
+                be provided. The values should correspond to the values seen in
+                the ``self.class_labels_raw`` attribute.
+            in_place (bool):
+                If ``True``, the object is modified in place. A new object is
+                returned with the ROIs removed either way.
+            verbose (Optional[bool]):
+                Whether to print progress messages. If ``None``, the verbosity
+                level set in the class is used.
+
+        Returns:
+            self (Data_roicat):
+                The object with the ROIs removed.
+        """
+        if verbose is None:
+            verbose = self._verbose
+
+        ## Check that class labels are set
+        assert hasattr(self, 'class_labels_raw'),    f"RH ERROR: class_labels_raw must be set before ROIs can be removed by class label. Use set_class_labels() to set class_labels_raw."
+        assert hasattr(self, 'unique_class_labels'), f"RH ERROR: unique_class_labels must be set before ROIs can be removed by class label. Use set_class_labels() to set unique_class_labels."
+        ## Check that classLabel_to_keep or classLabel_to_remove is provided
+        assert (classLabel_to_keep is not None) or (classLabel_to_remove is not None), f"RH ERROR: Either classLabel_to_keep or classLabel_to_remove must be provided."
+        ## Check that only one of classLabel_to_keep or classLabel_to_remove is provided
+        assert (classLabel_to_keep is None) or (classLabel_to_remove is None), f"RH ERROR: Only one of classLabel_to_keep or classLabel_to_remove can be provided."
+        ## Check that classLabel_to_keep or classLabel_to_remove is an int or a list of ints
+        if isinstance(classLabel_to_keep, np.ndarray):
+            classLabel_to_keep = classLabel_to_keep.tolist()
+        if isinstance(classLabel_to_remove, np.ndarray):
+            classLabel_to_remove = classLabel_to_remove.tolist()
+        if isinstance(classLabel_to_keep, int):
+            classLabel_to_keep = [classLabel_to_keep,]
+        if isinstance(classLabel_to_remove, int):
+            classLabel_to_remove = [classLabel_to_remove,]
+        assert (classLabel_to_keep is None)   or (isinstance(classLabel_to_keep, int)   or (isinstance(classLabel_to_keep, list)   and all([isinstance(cl, int) for cl in classLabel_to_keep]))),   f"RH ERROR: classLabel_to_keep must be an int or a list of ints."
+        assert (classLabel_to_remove is None) or (isinstance(classLabel_to_remove, int) or (isinstance(classLabel_to_remove, list) and all([isinstance(cl, int) for cl in classLabel_to_remove]))), f"RH ERROR: classLabel_to_remove must be an int or a list of ints."
+
+        print(f"Starting: Removing ROIs based on class labels...") if verbose else None
+
+        ## Get the class labels to keep
+        if classLabel_to_remove is not None:
+            classLabel_to_keep = [cl for cl in self.unique_class_labels if cl not in classLabel_to_remove]
+            print(f"Converted classLabel_to_remove: {classLabel_to_remove} to classLabel_to_keep: {classLabel_to_keep}.") if verbose else None
+
+        ## Get the indices of the class labels to keep for each session
+        idx_keep = [np.where(np.isin(cl, classLabel_to_keep))[0] for cl in self.class_labels_raw]
+
+        ## Make new object
+        print(f"Making new Data_roicat object with ROIs removed based on class labels...") if verbose else None
+        data_new = Data_roicat(verbose=verbose)
+
+        ## Remove the ROIs
+        if hasattr(self, 'spatialFootprints'):
+            print(f"Removing ROIs from spatialFootprints...") if verbose else None
+            sf = [sf[idx_keep[ii]] for ii, sf in enumerate(self.spatialFootprints)]
+            data_new.set_spatialFootprints(
+                spatialFootprints=sf,
+                um_per_pixel=self.um_per_pixel,
+            )
+        if hasattr(self, 'centroids'):
+            print(f"Removing ROIs from centroids...") if verbose else None
+            c = [c[idx_keep[ii]] for ii, c in enumerate(self.centroids)]
+            data_new.centroids = c
+            print(f"Centroids removed.") if verbose else None
+        if hasattr(self, 'ROI_images'):
+            print(f"Removing ROIs from ROI_images...") if verbose else None
+            ri = [ri[idx_keep[ii]] for ii, ri in enumerate(self.ROI_images)]
+            data_new.set_ROI_images(
+                ROI_images=ri,
+                um_per_pixel=self.um_per_pixel,
+            )
+        if hasattr(self, 'class_labels_raw'):
+            print(f"Removing ROIs from class_labels...") if verbose else None
+            cl = [cl[idx_keep[ii]] for ii, cl in enumerate(self.class_labels_raw)]
+            data_new.set_class_labels(
+                labels=cl,
+                n_classes=self.n_classes,
+            )
+        if hasattr(self, 'session_bool'):
+            print(f"Recomputing session_bool...") if verbose else None
+            data_new._make_session_bool()
+                
+        print(f"Completed: Removed ROIs based on class labels. New object created. Old n_roi_total={self.n_roi_total}, new n_roi_total={data_new.n_roi_total}. Old unique_class_labels={self.unique_class_labels}, new unique_class_labels={data_new.unique_class_labels}.") if verbose else None
+
+        if in_place:
+            ## Replace self with new object
+            ### Check to see if there are any attributes in the old object that are not in the new object
+            keys_old = set(self.__dict__.keys())
+            keys_new = set(data_new.__dict__.keys())
+            keys_missing = keys_old - keys_new
+            keys_extra = keys_new - keys_old
+            keys_in_both = keys_old.intersection(keys_new)
+            ## Print old keys
+            print(f"Existing attributes that will persist in new data object: {keys_missing}.") if verbose else None
+            ## Print intersection keys
+            print(f"Existing attributes that will be replaced in new data object: {keys_in_both}.") if verbose else None
+            if len(keys_extra) > 0:
+                warnings.warn(f"RH WARNING: The following attributes are in the new data object but not in the old data object: {keys_extra}. This is unexpected.")
+            self.__dict__.update(data_new.__dict__)
+            print(f"Performed in-place replacement of self with new data object.") if verbose else None
+            return self
+
+        return data_new
+                   
     def __repr__(self):
         ## Check which attributes are set
         attr_to_print = {key: val for key,val in self.__dict__.items() if key in [
-            'um_per_pixel', 
             'n_sessions', 
             'n_classes', 
             'n_class_labels', 
@@ -736,6 +905,7 @@ class Data_roicat(util.ROICaT_Module):
             'n_roi_total',
             'FOV_height',
             'FOV_width',
+            'um_per_pixel', 
         ]}
         return f"Data_roicat object: {attr_to_print}."
 
@@ -749,7 +919,8 @@ class Data_roicat(util.ROICaT_Module):
 
         Args:
             dict_load (Dict[str, Any]): 
-                Dictionary containing attributes to load.
+                Dictionary containing args to load. Format:
+                {'method': [arg1, arg2, ...], ...}
 
         Note: 
             This method does not return anything. It modifies the object state
@@ -757,13 +928,23 @@ class Data_roicat(util.ROICaT_Module):
         """
         ## Go through each important attribute in Data_roicat and look for it in dict_load
         methods = {
-            self.set_ROI_images: ['ROI_images', 'um_per_pixel'],
-            self.set_spatialFootprints: ['spatialFootprints', 'um_per_pixel'],
-            self.set_FOV_images: ['FOV_images'],
-            self.set_class_labels: ['class_labels_raw'],
+            self.set_ROI_images: {
+                'ROI_images': 'ROI_images',  ## 'arg_name': 'key_in_dict_load'
+                'um_per_pixel': 'um_per_pixel',
+            },
+            self.set_spatialFootprints: {
+                'spatialFootprints': 'spatialFootprints', 
+                'um_per_pixel': 'um_per_pixel',
+            },
+            self.set_FOV_images: {
+                'FOV_images': 'FOV_images',
+            },
+            self.set_class_labels: {
+                'labels': 'class_labels_raw',
+            },
         }
 
-        methodKeys_all = list(set(sum(list(methods.values()), [])))
+        methodKeys_all = list(set(sum([list(args_keys.values()) for args_keys in methods.values()], [])))
         
         ## Set other attributes
         for key, val in dict_load.items():
@@ -771,11 +952,11 @@ class Data_roicat(util.ROICaT_Module):
                 setattr(self, key, val)
 
         ## Set attributes using methods
-        for method, methodKeys in methods.items():
-            if all([key in dict_load for key in methodKeys]):
-                method(**{key: dict_load[key] for key in methodKeys})
+        for method, args_keys in methods.items():
+            if all([key in dict_load for key in args_keys.values()]):
+                method(**{arg: dict_load[key] for arg, key in args_keys.items()})
             else:
-                print(f"RH WARNING: Could not load attribute using method {method.__name__}. Keys {methodKeys} not found in dict_load.") if self._verbose else None
+                print(f"RH WARNING: Could not load attribute using method {method.__name__}. Keys {args_keys.values()} not found in dict_load.") if self._verbose else None
         
 
 ############################################################################################################################
@@ -802,14 +983,19 @@ class Data_suite2p(Data_roicat):
             pathlib.Path, list of str or list of pathlib.Path. Optional. Used to
             get FOV_images, FOV_height, FOV_width, and shifts (if old matlab ops
             file).
-        um_per_pixel (float):
+        um_per_pixel (Union[float, List[float]]):
             Resolution in micrometers per pixel of the imaging field of view.
+            The conversion factor from pixels to microns. This is used to scale
+            the ROI_images to a common size. Should either be a float or a list
+            of floats, one for each session.
         new_or_old_suite2p (str):
             Type of suite2p output files. Matlab=old, Python=new. Should be:
             ``'new'`` or ``'old'``.
         out_height_width (tuple of int):
-            Height and width of output ROI images. Should be: *(int, int)* *(y,
-            x)*.
+            Height and width of output ROI images. These are the little images
+            of centered ROIs that are typically used for passing through the
+            neural net. Unless your ROIs are larger than the default size, it's
+            best to just leave it as default. Should be: *(int, int)* *(y, x)*.
         type_meanImg (str):
             Type of mean image to use. Should be: ``'meanImgE'`` or
             ``'meanImg'``.
@@ -825,6 +1011,13 @@ class Data_suite2p(Data_roicat):
             n_roi specifying the class label for each ROI. If list of str, each
             element should be a path to a .npy file containing an array of
             length n_roi specifying the class label for each ROI.
+        paths_iscell (str or pathlib.Path or list of str or list of pathlib.Path):
+            Optional. Paths to the iscell.npy files. Elements should be one of:
+            str, pathlib.Path, list of str or list of pathlib.Path. If provided,
+            the iscell.npy files are used to set the class labels. If not
+            provided, the class labels are set to None. An iscell.npy file is
+            assumed to be a 2D numpy array of shape *(n_ROIs, (iscell boolean,
+            probability float))*
         FOV_height_width (tuple of int, optional):
             FOV height and width. If ``None``, **paths_opsFiles** must be
             provided to get FOV height and width.
@@ -835,13 +1028,14 @@ class Data_suite2p(Data_roicat):
         self,
         paths_statFiles: Union[str, pathlib.Path, List[Union[str, pathlib.Path]]],
         paths_opsFiles: Optional[Union[str, pathlib.Path, List[Union[str, pathlib.Path]]]] = None,
-        um_per_pixel: float = 1.0,
+        um_per_pixel: Union[float, List[float]] = 1.0,
         new_or_old_suite2p: str = 'new',
         out_height_width: Tuple[int, int] = (36, 36),
         type_meanImg: str = 'meanImgE',
         FOV_images: Optional[np.ndarray] = None,
         centroid_method: str = 'centerOfMass',
         class_labels: Optional[Union[List[np.ndarray], List[str], None]] = None,
+        paths_iscell: Optional[Union[str, pathlib.Path, List[Union[str, pathlib.Path]]]] = None,
         FOV_height_width: Optional[Tuple[int, int]] = None,
         verbose: bool = True,
     ):
@@ -855,6 +1049,23 @@ class Data_suite2p(Data_roicat):
         self.paths_stat = fix_paths(paths_statFiles)
         self.paths_ops = fix_paths(paths_opsFiles) if paths_opsFiles is not None else None
         self.n_sessions = len(self.paths_stat)
+
+        ## Store parameter (but not data) args as attributes
+        self.params['__init__'] = self._locals_to_params(
+            locals_dict=locals(),
+            keys=[
+                'paths_statFiles',
+                'paths_opsFiles',
+                'um_per_pixel',
+                'new_or_old_suite2p', 
+                'out_height_width', 
+                'type_meanImg', 
+                'centroid_method', 
+                'paths_iscell',
+                'FOV_height_width',
+                'verbose',
+            ],
+        )
 
         self._verbose = verbose
         
@@ -887,10 +1098,13 @@ class Data_suite2p(Data_roicat):
         self._make_spatialFootprintCentroids(method=centroid_method)
         
         ## Transform spatial footprints to ROI images
-        self._transform_spatialFootprints_to_ROIImages(out_height_width=out_height_width)
+        self.transform_spatialFootprints_to_ROIImages(out_height_width=out_height_width)
 
         ## Make class labels
-        self.set_class_labels(labels=class_labels) if class_labels is not None else None
+        if class_labels is not None:
+            self.set_class_labels(labels=class_labels)
+        elif paths_iscell is not None:
+            self.set_class_labels(labels=[np.load(path)[:,0].astype(np.int64) for path in fix_paths(paths_iscell)])
 
 
     def import_FOV_images(
@@ -918,7 +1132,7 @@ class Data_suite2p(Data_roicat):
         
         assert self.paths_ops is not None, "RH ERROR: paths_ops is None. Please set paths_ops before calling this function."
         assert len(self.paths_ops) > 0, "RH ERROR: paths_ops is empty. Please set paths_ops before calling this function."
-        assert all([Path(path).exists() for path in self.paths_ops]), "RH ERROR: One or more paths in paths_ops do not exist."
+        assert all([Path(path).exists() for path in self.paths_ops]), f"RH ERROR: One or more paths in paths_ops do not exist: {[path for path in self.paths_ops if not Path(path).exists()]}"
 
         FOV_images = [np.load(path, allow_pickle=True)[()][type_meanImg] for path in self.paths_ops]
 
@@ -970,7 +1184,7 @@ class Data_suite2p(Data_roicat):
 
         assert self.paths_stat is not None, "RH ERROR: paths_stat is None. Please set paths_stat before calling this function."
         assert len(self.paths_stat) > 0, "RH ERROR: paths_stat is empty. Please set paths_stat before calling this function."
-        assert all([Path(path).exists() for path in self.paths_stat]), "RH ERROR: One or more paths in paths_stat do not exist."
+        assert all([Path(path).exists() for path in self.paths_stat]), f"RH ERROR: One or more paths in paths_stat do not exist: {[path for path in self.paths_stat if not Path(path).exists()]}"
 
         assert hasattr(self, 'shifts'), "RH ERROR: shifts is not defined. Please call ._make_shifts before calling this function."
 
@@ -978,7 +1192,7 @@ class Data_suite2p(Data_roicat):
 
         n = self.n_sessions
         spatialFootprints = [
-            self._transform_statFile_to_spatialFootprints(
+            _transform_statFile_to_spatialFootprints(
                 frame_height_width=frame_height_width,
                 stat=statFiles[ii],
                 shifts=self.shifts[ii],
@@ -1021,7 +1235,7 @@ class Data_suite2p(Data_roicat):
 
         assert self.paths_stat is not None, "RH ERROR: paths_stat is None. Please set paths_stat before calling this function."
         assert len(self.paths_stat) > 0, "RH ERROR: paths_stat is empty. Please set paths_stat before calling this function."
-        assert all([Path(path).exists() for path in self.paths_stat]), "RH ERROR: One or more paths in paths_stat do not exist."
+        assert all([Path(path).exists() for path in self.paths_stat]), f"RH ERROR: One or more paths in paths_stat do not exist: {[path for path in self.paths_stat if not Path(path).exists()]}"
 
         assert hasattr(self, 'shifts'), "RH ERROR: shifts is not defined. Please call ._make_shifts before calling this function."
 
@@ -1029,7 +1243,7 @@ class Data_suite2p(Data_roicat):
 
         n = self.n_sessions
         neuropilMasks = [
-            self._transform_statFile_to_neuropilMasks(
+            _transform_statFile_to_neuropilMasks(
                 frame_height_width=frame_height_width,
                 stat=statFiles[ii],
                 shifts=self.shifts[ii],
@@ -1076,96 +1290,94 @@ class Data_suite2p(Data_roicat):
             raise ValueError(f"RH ERROR: new_or_old_suite2p should be 'new' or 'old'. Got {new_or_old_suite2p}")
         return shifts
 
-    @staticmethod
-    def _transform_statFile_to_spatialFootprints(
-        frame_height_width: Tuple[int, int], 
-        stat: np.ndarray, 
-        shifts: Tuple[int, int] = (0, 0), 
-        dtype: Optional[np.dtype] = None, 
-        normalize_mask: bool = True,
-    ) -> scipy.sparse.csr_matrix:
-        """
-        Populates a sparse array with the spatial footprints from ROIs in a stat
-        file.
+def _transform_statFile_to_spatialFootprints(
+    frame_height_width: Tuple[int, int], 
+    stat: np.ndarray, 
+    shifts: Tuple[int, int] = (0, 0), 
+    dtype: Optional[np.dtype] = None, 
+    normalize_mask: bool = True,
+) -> scipy.sparse.csr_matrix:
+    """
+    Populates a sparse array with the spatial footprints from ROIs in a stat
+    file.
 
-        Args:
-            frame_height_width (Tuple[int, int]):
-                Height and width of the frame.
-            stat (np.ndarray):
-                Stat file containing ROIs information.
-            shifts (Tuple[int, int]):
-                Shifts in x and y coordinates to apply to ROIs. Default is (0,
-                0).
-            dtype (Optional[np.dtype]):
-                Data type of the array elements. If ``None``, it will be
-                inferred from the data. Default is ``None``.
-            normalize_mask (bool):
-                If True, normalize the mask. Default is ``True``.
+    Args:
+        frame_height_width (Tuple[int, int]):
+            Height and width of the frame.
+        stat (np.ndarray):
+            Stat file containing ROIs information.
+        shifts (Tuple[int, int]):
+            Shifts in x and y coordinates to apply to ROIs. Default is (0,
+            0).
+        dtype (Optional[np.dtype]):
+            Data type of the array elements. If ``None``, it will be
+            inferred from the data. Default is ``None``.
+        normalize_mask (bool):
+            If True, normalize the mask. Default is ``True``.
 
-        Returns:
-            (scipy.sparse.csr_matrix):
-                spatialFootprints (scipy.sparse.csr_matrix):
-                    Sparse array of shape *(n_roi, frame_height * frame_width)*
-                    containing the spatial footprints of the ROIs.
-        """
-        isInt = np.issubdtype(dtype, np.integer)
+    Returns:
+        (scipy.sparse.csr_matrix):
+            spatialFootprints (scipy.sparse.csr_matrix):
+                Sparse array of shape *(n_roi, frame_height * frame_width)*
+                containing the spatial footprints of the ROIs.
+    """
+    isInt = np.issubdtype(dtype, np.integer)
 
-        rois_to_stack = []
-        
-        for jj, roi in enumerate(stat):
-            lam = np.array(roi['lam'], ndmin=1)
-            dtype = dtype if dtype is not None else lam.dtype
-            if isInt:
-                lam = dtype(lam / lam.sum() * np.iinfo(dtype).max) if normalize_mask else dtype(lam)
-            else:
-                lam = lam / lam.sum() if normalize_mask else lam
-            ypix = np.array(roi['ypix'], dtype=np.uint64, ndmin=1) + shifts[0]
-            xpix = np.array(roi['xpix'], dtype=np.uint64, ndmin=1) + shifts[1]
-        
-            tmp_roi = scipy.sparse.csr_matrix((lam, (ypix, xpix)), shape=(frame_height_width[0], frame_height_width[1]), dtype=dtype)
-            rois_to_stack.append(tmp_roi.reshape(1,-1))
+    rois_to_stack = []
+    
+    for jj, roi in enumerate(stat):
+        lam = np.array(roi['lam'], ndmin=1)
+        dtype = dtype if dtype is not None else lam.dtype
+        if isInt:
+            lam = dtype(lam / lam.sum() * np.iinfo(dtype).max) if normalize_mask else dtype(lam)
+        else:
+            lam = lam / lam.sum() if normalize_mask else lam
+        ypix = np.array(roi['ypix'], dtype=np.uint64, ndmin=1) + shifts[0]
+        xpix = np.array(roi['xpix'], dtype=np.uint64, ndmin=1) + shifts[1]
+    
+        tmp_roi = scipy.sparse.csr_matrix((lam, (ypix, xpix)), shape=(frame_height_width[0], frame_height_width[1]), dtype=dtype)
+        rois_to_stack.append(tmp_roi.reshape(1,-1))
 
-        return scipy.sparse.vstack(rois_to_stack).tocsr()
+    return scipy.sparse.vstack(rois_to_stack).tocsr()
 
-    @staticmethod
-    def _transform_statFile_to_neuropilMasks(
-        frame_height_width: Tuple[int, int], 
-        stat: np.ndarray, 
-        shifts: Tuple[int, int] = (0, 0)
-    ) -> scipy.sparse.csr_matrix:
-        """
-        Populates a sparse array with the neuropil masks from ROIs in a stat
-        file.
+def _transform_statFile_to_neuropilMasks(
+    frame_height_width: Tuple[int, int], 
+    stat: np.ndarray, 
+    shifts: Tuple[int, int] = (0, 0)
+) -> scipy.sparse.csr_matrix:
+    """
+    Populates a sparse array with the neuropil masks from ROIs in a stat
+    file.
 
-        Args:
-            frame_height_width (Tuple[int, int]):
-                Height and width of the frame.
-            stat (np.ndarray):
-                Stat file containing ROIs information.
-            shifts (Tuple[int, int]):
-                Shifts in x and y coordinates to apply to ROIs. Default is (0,
-                0).
+    Args:
+        frame_height_width (Tuple[int, int]):
+            Height and width of the frame.
+        stat (np.ndarray):
+            Stat file containing ROIs information.
+        shifts (Tuple[int, int]):
+            Shifts in x and y coordinates to apply to ROIs. Default is (0,
+            0).
 
-        Returns:
-            (scipy.sparse.csr_matrix):
-                neuropilMasks (scipy.sparse.csr_matrix):
-                    Sparse array of shape *(n_roi, frame_height * frame_width)*
-                    containing the neuropil masks of the ROIs.
-        """
-        
-        rois_to_stack = []
-        
-        for jj, roi in enumerate(stat):
-            lam = np.ones(len(roi['neuropil_mask']), dtype=np.bool_)
-            dtype = np.bool_
-            ypix, xpix = np.unravel_index(roi['neuropil_mask'], shape=(frame_height_width[0], frame_height_width[1]), order='C')
-            ypix = ypix + shifts[0]
-            xpix = xpix + shifts[1]
-        
-            tmp_roi = scipy.sparse.csr_matrix((lam, (ypix, xpix)), shape=(frame_height_width[0], frame_height_width[1]), dtype=dtype)
-            rois_to_stack.append(tmp_roi.reshape(1,-1))
+    Returns:
+        (scipy.sparse.csr_matrix):
+            neuropilMasks (scipy.sparse.csr_matrix):
+                Sparse array of shape *(n_roi, frame_height * frame_width)*
+                containing the neuropil masks of the ROIs.
+    """
+    
+    rois_to_stack = []
+    
+    for jj, roi in enumerate(stat):
+        lam = np.ones(len(roi['neuropil_mask']), dtype=np.bool_)
+        dtype = np.bool_
+        ypix, xpix = np.unravel_index(roi['neuropil_mask'], shape=(frame_height_width[0], frame_height_width[1]), order='C')
+        ypix = ypix + shifts[0]
+        xpix = xpix + shifts[1]
+    
+        tmp_roi = scipy.sparse.csr_matrix((lam, (ypix, xpix)), shape=(frame_height_width[0], frame_height_width[1]), dtype=dtype)
+        rois_to_stack.append(tmp_roi.reshape(1,-1))
 
-        return scipy.sparse.vstack(rois_to_stack).tocsr()
+    return scipy.sparse.vstack(rois_to_stack).tocsr()
 
 
 #########################################################
@@ -1183,8 +1395,11 @@ class Data_caiman(Data_roicat):
         include_discarded (bool):
             If ``True``, include ROIs that were discarded by CaImAn. Default is
             ``True``.
-        um_per_pixel (float):
-            Microns per pixel. Default is 1.0.
+        um_per_pixel (Union[float, List[float]]):
+            Resolution in micrometers per pixel of the imaging field of view.
+            The conversion factor from pixels to microns. This is used to scale
+            the ROI_images to a common size. Should either be a float or a list
+            of floats, one for each session.
         out_height_width (List[int]):
             Output height and width. Default is [36, 36].
         centroid_method (str):
@@ -1214,6 +1429,19 @@ class Data_caiman(Data_roicat):
         # self._include_discarded = include_discarded
         self._verbose = verbose
 
+        ## Store parameter (but not data) args as attributes
+        self.params['__init__'] = self._locals_to_params(
+            locals_dict=locals(),
+            keys=[
+                'paths_resultsFiles',
+                'include_discarded',
+                'um_per_pixel',
+                'out_height_width', 
+                'centroid_method', 
+                'verbose',
+            ],
+        )
+
         # 1. import_caiman_results
         # # self.spatialFootprints
         # ?? # self.overall_caiman_labels
@@ -1234,7 +1462,7 @@ class Data_caiman(Data_roicat):
         self.set_FOV_images(FOV_images=FOV_images)
         self._make_spatialFootprintCentroids(method=centroid_method)
         self._make_session_bool()
-        self._transform_spatialFootprints_to_ROIImages(out_height_width=out_height_width)
+        self.transform_spatialFootprints_to_ROIImages(out_height_width=out_height_width)
         self.set_class_labels(labels=class_labels) if class_labels is not None else None
 
     def set_caimanLabels(self, overall_caimanLabels: List[List[bool]]) -> None:
@@ -1483,9 +1711,11 @@ class Data_roiextractors(Data_roicat):
         segmentation_extractor_objects (list): 
             List of segmentation extractor objects. All objects must be of the
             same type.
-        um_per_pixel (float, optional): 
-            The resolution, specified as 'micrometers per pixel' of the imaging
-            field of view. Defaults to 1.0.
+        um_per_pixel (Union[float, List[float]]):
+            Resolution in micrometers per pixel of the imaging field of view.
+            The conversion factor from pixels to microns. This is used to scale
+            the ROI_images to a common size. Should either be a float or a list
+            of floats, one for each session.
         out_height_width (tuple of int, optional): 
             The height and width of output ROI images, specified as *(y, x)*.
             Defaults to *[36,36]*.
@@ -1525,6 +1755,18 @@ class Data_roiextractors(Data_roicat):
         
         ## Inherit from Data_roicat
         super().__init__()
+
+        ## Store parameter (but not data) args as attributes
+        self.params['__init__'] = self._locals_to_params(
+            locals_dict=locals(),
+            keys=[
+                'out_height_width', 
+                'FOV_image_name', 
+                'fallback_FOV_height_width', 
+                'centroid_method', 
+                'verbose',
+            ],
+        )
 
         self._verbose = verbose
 
@@ -1582,7 +1824,7 @@ class Data_roiextractors(Data_roicat):
         self._make_spatialFootprintCentroids(method=centroid_method)
 
         ## Transform spatial footprints to ROI images
-        self._transform_spatialFootprints_to_ROIImages(out_height_width=out_height_width)
+        self.transform_spatialFootprints_to_ROIImages(out_height_width=out_height_width)
 
         ## Make class labels
         self.set_class_labels(labels=class_labels) if class_labels is not None else None
@@ -1717,7 +1959,7 @@ def make_smaller_data(
     )
 
     data_out._make_spatialFootprintCentroids()
-    data_out._transform_spatialFootprints_to_ROIImages()
+    data_out.transform_spatialFootprints_to_ROIImages()
     data_out._make_session_bool()
 
     return data_out

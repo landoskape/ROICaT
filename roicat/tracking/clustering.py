@@ -9,7 +9,7 @@ import scipy.signal
 import sklearn
 import matplotlib.pyplot as plt
 import torch
-from tqdm import tqdm
+from tqdm.auto import tqdm
 # import optuna
 
 from .. import helpers, util
@@ -46,6 +46,17 @@ class Clusterer(util.ROICaT_Module):
             The similarity matrix for session similarity. Shape: *(n_rois,
             n_rois)*. Boolean, with 1s where the two ROIs are from different
             sessions.
+        n_bins (int): 
+            Number of bins to use for the pairwise similarity distribution. If
+            using automatic parameter finding, then using a large number of bins
+            makes finding the separation point more noisy, and only slightly
+            more accurate. If ``None``, then a heuristic is used to estimate the
+            value based on the number of ROIs. (Default is ``50``)
+        smoothing_window_bins (int): 
+            Number of bins to use when smoothing the distribution. Using a small
+            number of bins makes finding the separation point more noisy, and
+            only slightly more accurate. Aim for 5-10% of the number of bins. If
+            ``None``, then a heuristic is used. (Default is ``5``)
         verbose (bool):
             Specifies whether to print out information about the clustering
             process. (Default is ``True``)
@@ -65,25 +76,44 @@ class Clusterer(util.ROICaT_Module):
         s_sesh (scipy.sparse.csr_matrix):
             The similarity matrix for session similarity. It is symmetric and
             has a shape of *(n_rois, n_rois)*.
+        s_sesh_inv (scipy.sparse.csr_matrix):
+            The inverse of the session similarity matrix. It is symmetric and
+            has a shape of *(n_rois, n_rois)*.
+        n_bins Optional[int]:
+            Number of bins to use for the pairwise similarity distribution.
+        smoothing_window_bins Optional[int]:
+            Number of bins to use when smoothing the distribution.
         verbose (bool):
-            Specifies how much information to print out:
-                0/False: Warnings only
-                1/True: Basic info, progress bar
-                2: All info
+            Specifies how much information to print out: \n
+                * 0/False: Warnings only
+                * 1/True: Basic info, progress bar
+                * 2: All info
     """
     def __init__(
         self,
-        s_sf=None,
-        s_NN_z=None,
-        s_SWT_z=None,
-        s_sesh=None,
-        verbose=True,
+        s_sf: Optional[scipy.sparse.csr_matrix] = None,
+        s_NN_z: Optional[scipy.sparse.csr_matrix] = None,
+        s_SWT_z: Optional[scipy.sparse.csr_matrix] = None,
+        s_sesh: Optional[scipy.sparse.csr_matrix] = None,
+        n_bins: Optional[int] = None,
+        smoothing_window_bins: Optional[int] = None,
+        verbose: bool = True,
     ):
         """
         Initializes the Clusterer with the given similarity matrices and verbosity setting.
         """
         ## Imports
         super().__init__()
+
+        ## Store parameter (but not data) args as attributes
+        self.params['__init__'] = self._locals_to_params(
+            locals_dict=locals(),
+            keys=[
+                'n_bins',
+                'smoothing_window_bins',
+                'verbose',
+            ],
+        )
 
         self.s_sf = s_sf
         self.s_NN_z = s_NN_z
@@ -103,27 +133,31 @@ class Clusterer(util.ROICaT_Module):
 
         self._verbose = verbose
 
+        self.n_bins = max(min(self.s_sf.nnz // 10000, 200), 20) if n_bins is None else n_bins
+        self.smooth_window = helpers.make_odd(self.n_bins // 10, mode='up') if smoothing_window_bins is None else smoothing_window_bins
+        # print(f'Pruning similarity graphs with {self.n_bins} bins and smoothing window {smoothing_window}...') if self._verbose else None
+        
     def find_optimal_parameters_for_pruning(
         self,
-        n_bins: int = 50,
-        smoothing_window_bins: int = 5,
         kwargs_findParameters: Dict[str, Union[int, float, bool]] = {
             'n_patience': 100,
             'tol_frac': 0.05,
             'max_trials': 350,
             'max_duration': 60*10,
+            'value_stop': 0.0,
         },
-        bounds_findParameters: Dict[str, Tuple[float, float]] = {
-            'power_SF': (0.3, 2),
-            'power_NN': (0.2, 2),
-            'power_SWT': (0.1, 1),
-            'p_norm': (-5, 5),
-            'sig_NN_kwargs_mu': (0, 0.5),
-            'sig_NN_kwargs_b': (0.05, 2),
-            'sig_SWT_kwargs_mu': (0, 0.5),
-            'sig_SWT_kwargs_b': (0.05, 2),
+        bounds_findParameters: Dict[str, List[float]] = {
+            'power_NN': [0.0, 2.],  ## Bounds for the exponent applied to s_NN
+            'power_SWT': [0.0, 2.],  ## Bounds for the exponent applied to s_SWT
+            'p_norm': [-5, -0.1],  ## Bounds for the p-norm p value (Minkowski) applied to mix the matrices
+            'sig_NN_kwargs_mu': [0., 1.0],  ## Bounds for the sigmoid center for s_NN
+            'sig_NN_kwargs_b': [0.1, 1.5],  ## Bounds for the sigmoid slope for s_NN
+            'sig_SWT_kwargs_mu': [0., 1.0],  ## Bounds for the sigmoid center for s_SWT
+            'sig_SWT_kwargs_b': [0.1, 1.5],  ## Bounds for the sigmoid slope for s_SWT
         },
         n_jobs_findParameters: int = -1,
+        n_bins: Optional[int] = None,
+        smoothing_window_bins: Optional[int] = None,
         seed=None,
     ) -> Dict:
         """
@@ -143,15 +177,6 @@ class Clusterer(util.ROICaT_Module):
         RH 2023
 
         Args:
-            n_bins (int): 
-                Number of bins to use when estimating the distributions. Using a
-                large number of bins makes finding the separation point more
-                noisy, and only slightly more accurate. (Default is ``50``)
-            smoothing_window_bins (int): 
-                Number of bins to use when smoothing the distributions. Using a
-                small number of bins makes finding the separation point more
-                noisy, and only slightly more accurate. Aim for 5-10% of the
-                number of bins. (Default is ``5``)
             kwargs_findParameters (Dict[str, Union[int, float, bool]]): 
                 Keyword arguments for the Convergence_checker class __init__.
             bounds_findParameters (Dict[str, Tuple[float, float]]):
@@ -159,6 +184,18 @@ class Clusterer(util.ROICaT_Module):
             n_jobs_findParameters (int):
                 Number of jobs to use when finding the optimal parameters. If
                 -1, use all available cores.
+            n_bins Optional[int]: 
+                Overwrites ``n_bins`` specified in __init__. \n
+                Number of bins to use when estimating the distributions. Using a
+                large number of bins makes finding the separation point more
+                noisy, and only slightly more accurate. (Default is ``None`` or
+                ``50``)
+            smoothing_window_bins (int): 
+                Overwrites ``smoothing_window_bins`` specified in __init__. \n
+                Number of bins to use when smoothing the distributions. Using a
+                small number of bins makes finding the separation point more
+                noisy, and only slightly more accurate. Aim for 5-10% of the
+                number of bins. (Default is ``None`` or ``5``)
             seed (int):
                 Seed for the random number generator in the optuna sampler.
                 None: use a random seed.
@@ -170,18 +207,37 @@ class Clusterer(util.ROICaT_Module):
                     self.make_conjunctive_distance_matrix function.
         """
         import optuna
+
+        ## Store parameter (but not data) args as attributes
+        self.params['find_optimal_parameters_for_pruning'] = self._locals_to_params(
+            locals_dict=locals(),
+            keys=[
+                'kwargs_findParameters',
+                'bounds_findParameters',
+                'n_jobs_findParameters',
+                'n_bins',
+                'smoothing_window_bins',
+                'seed',
+            ],
+        )
+
+        self.n_bins = self.n_bins if n_bins is None else n_bins
+        self.smoothing_window_bins = self.smooth_window if smoothing_window_bins is None else smoothing_window_bins
+
         self.bounds_findParameters = bounds_findParameters
 
         self._seed = seed
         np.random.seed(self._seed)
 
-        self.n_bins = max(min(self.s_sf.nnz // 30000, 1000), 30) if n_bins is None else n_bins
-        self.smooth_window = self.n_bins // 10 if smoothing_window_bins is None else smoothing_window_bins
-        # print(f'Pruning similarity graphs with {self.n_bins} bins and smoothing window {smoothing_window}...') if self._verbose else None
-
         print('Finding mixing parameters using automated hyperparameter tuning...') if self._verbose else None
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         self.checker = helpers.Convergence_checker_optuna(verbose=self._verbose>=2, **kwargs_findParameters)
+        prog_bar = helpers.OptunaProgressBar(
+            n_trials=kwargs_findParameters['max_trials'], 
+            # timeout=kwargs_findParameters['max_duration'],
+            # timeout=10,
+            mininterval=5.0,
+        )
         self.study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(
             n_startup_trials=kwargs_findParameters['n_patience']//2,
             seed=self._seed,
@@ -189,9 +245,10 @@ class Clusterer(util.ROICaT_Module):
         self.study.optimize(
             func=self._objectiveFn_distSameMagnitude, 
             n_jobs=n_jobs_findParameters, 
-            callbacks=[self.checker.check],
+            callbacks=[self.checker.check, prog_bar],
             n_trials=kwargs_findParameters['max_trials'],
-            show_progress_bar=self._verbose >= 1,
+            # show_progress_bar=self._verbose >= 1,
+            show_progress_bar=False,
         )
 
         self.best_params = self.study.best_params.copy()
@@ -254,6 +311,16 @@ class Clusterer(util.ROICaT_Module):
                 ``None``, then the optimal cutoff distance is inferred. (Default
                 is ``None``)
         """
+        ## Store parameter (but not data) args as attributes
+        self.params['make_pruned_similarity_graphs'] = self._locals_to_params(
+            locals_dict=locals(),
+            keys=[
+                'convert_to_probability',
+                'stringency',
+                'kwargs_makeConjunctiveDistanceMatrix',
+            ],
+        )
+
         if kwargs_makeConjunctiveDistanceMatrix is None:
             if hasattr(self, 'kwargs_makeConjunctiveDistanceMatrix_best'):
                 kwargs_makeConjunctiveDistanceMatrix = self.kwargs_makeConjunctiveDistanceMatrix_best
@@ -333,7 +400,7 @@ class Clusterer(util.ROICaT_Module):
 
     def fit(
         self,
-        d_conj: float,
+        d_conj: scipy.sparse.csr_matrix,
         session_bool: np.ndarray,
         min_cluster_size: int = 2,
         n_iter_violationCorrection: int = 5,
@@ -356,7 +423,7 @@ class Clusterer(util.ROICaT_Module):
            other ROIs outside the cluster that are from the same session. \n
 
         Args:
-            d_conj (float): 
+            d_conj (scipy.sparse.csr_matrix): 
                 Conjunctive distance matrix.
             session_bool (np.ndarray): 
                 Boolean array indicating which ROIs belong to which session.
@@ -399,6 +466,21 @@ class Clusterer(util.ROICaT_Module):
                 labels (np.ndarray): 
                     Cluster labels for each ROI, shape: *(n_rois_total)*
         """
+        ## Store parameter (but not data) args as attributes
+        self.params['fit'] = self._locals_to_params(
+            locals_dict=locals(),
+            keys=[
+                'min_cluster_size',
+                'n_iter_violationCorrection',
+                'cluster_selection_method',
+                'd_clusterMerge',
+                'alpha',
+                'split_intraSession_clusters',
+                'discard_failed_pruning',
+                'n_steps_clusterSplit',
+            ],
+        )
+
         import hdbscan
         d = d_conj.copy().multiply(self.s_sesh)
 
@@ -557,6 +639,11 @@ class Clusterer(util.ROICaT_Module):
                 labels (np.ndarray): 
                     Cluster labels. Shape: *(n_rois,)*
         """
+        ## Store parameter (but not data) args as attributes
+        self.params['fit_sequentialHungarian'] = self._locals_to_params(
+            locals_dict=locals(),
+            keys=['thresh_cost',],)
+
         print(f"Clustering with CaImAn's sequential Hungarian algorithm method...") if self._verbose else None
         def find_matches(D_s):
             # todo todocument
@@ -647,9 +734,8 @@ class Clusterer(util.ROICaT_Module):
         self.labels = labels
         return self.labels
             
-    @classmethod
     def make_conjunctive_distance_matrix(
-        cls,
+        self,
         s_sf: Optional[scipy.sparse.csr_matrix] = None,
         s_NN: Optional[scipy.sparse.csr_matrix] = None,
         s_SWT: Optional[scipy.sparse.csr_matrix] = None,
@@ -723,15 +809,29 @@ class Clusterer(util.ROICaT_Module):
         assert (s_sf is not None) or (s_NN is not None) or (s_SWT is not None), \
             'At least one of s_sf, s_NN, or s_SWT must be provided.'
         
+        ## Store parameter (but not data) args as attributes
+        self.params['make_conjunctive_distance_matrix'] = self._locals_to_params(
+            locals_dict=locals(),
+            keys=[
+                'power_SF',
+                'power_NN',
+                'power_SWT',
+                'p_norm',
+                'sig_SF_kwargs',
+                'sig_NN_kwargs',
+                'sig_SWT_kwargs',
+            ],
+        )
+        
         p_norm = 1e-9 if p_norm == 0 else p_norm
 
-        sSF_data = cls._activation_function(s_sf.data, sig_SF_kwargs, power_SF) if s_sf is not None else None
-        sNN_data = cls._activation_function(s_NN.data, sig_NN_kwargs, power_NN) if s_NN is not None else None
-        sSWT_data = cls._activation_function(s_SWT.data, sig_SWT_kwargs, power_SWT) if s_SWT is not None else None
+        sSF_data = self._activation_function(s_sf.data, sig_SF_kwargs, power_SF) if s_sf is not None else None
+        sNN_data = self._activation_function(s_NN.data, sig_NN_kwargs, power_NN) if s_NN is not None else None
+        sSWT_data = self._activation_function(s_SWT.data, sig_SWT_kwargs, power_SWT) if s_SWT is not None else None
 
         s_list = [s for s in [sSF_data, sNN_data, sSWT_data] if s is not None]
         
-        sConj_data = cls._pNorm(
+        sConj_data = self._pNorm(
             s_list=s_list,
             p=p_norm,
         )
@@ -750,11 +850,10 @@ class Clusterer(util.ROICaT_Module):
 
         return dConj, sConj, sSF_data, sNN_data, sSWT_data, sConj_data
 
-    @classmethod
     def _activation_function(
-        cls, 
+        self, 
         s: Optional[torch.Tensor] = None, 
-        sig_kwargs: Dict[str, float] = {'mu':0.0, 'b':1.0}, 
+        sig_kwargs: Optional[Dict[str, float]] = {'mu':0.0, 'b':1.0}, 
         power: Optional[float] = 1
     ) -> Optional[torch.Tensor]:
         """
@@ -779,19 +878,16 @@ class Clusterer(util.ROICaT_Module):
         """
         if s is None:
             return None
-        if (sig_kwargs is not None) and (power is not None):
-            return helpers.generalised_logistic_function(torch.as_tensor(s, dtype=torch.float32), **sig_kwargs)**power
-        elif (sig_kwargs is None) and (power is not None):
-            return torch.maximum(torch.as_tensor(s, dtype=torch.float32), torch.as_tensor([0], dtype=torch.float32))**power
-            # return torch.as_tensor(s, dtype=torch.float32)**power
-        elif (sig_kwargs is not None) and (power is None):
-            return helpers.generalised_logistic_function(torch.as_tensor(s, dtype=torch.float32), **sig_kwargs)
-        else:
-            return torch.as_tensor(s, dtype=torch.float32)
         
-    @classmethod
+        s = torch.as_tensor(s, dtype=torch.float32)
+        ## make functions such that if the param is None, then no operation is applied
+        fn_sigmoid = lambda x, params: helpers.generalised_logistic_function(x, **params) if params is not None else x
+        fn_power = lambda x, p: x ** p if p is not None else x
+        
+        return fn_power(torch.clamp(fn_sigmoid(s, sig_kwargs), min=0), power)
+        
     def _pNorm(
-        cls, 
+        self, 
         s_list: List[Optional[torch.Tensor]], 
         p: float
     ) -> torch.Tensor:
@@ -921,7 +1017,7 @@ class Clusterer(util.ROICaT_Module):
             print('No crossover found, not plotting')
             return None
         
-        plt.figure()
+        fig = plt.figure()
         plt.stairs(dens_same, edges, linewidth=5)
         plt.stairs(dens_same_crop, edges, linewidth=3)
         plt.stairs(dens_diff, edges)
@@ -935,6 +1031,30 @@ class Clusterer(util.ROICaT_Module):
         plt.xlabel('distance or prob(different)')
         plt.ylabel('counts or density')
         plt.legend(['same', 'same (cropped)', 'diff', 'all', 'diff - same', 'all - diff', '(diff * same) * 1000', 'crossover'])
+        return fig
+
+    def _fn_smooth(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Smooths a 1D tensor using a convolution operation.
+
+        Args:
+            x (torch.Tensor): 
+                1D tensor to be smoothed.
+
+        Returns:
+            (torch.Tensor): 
+                Smoothed tensor.
+        """
+        return helpers.Convolver_1d(
+            kernel=torch.ones(self.smooth_window),
+            length_x=self.n_bins,
+            pad_mode='same',
+            correct_edge_effects=True,
+            device='cpu',
+        ).convolve(x)
 
     def _separate_diffSame_distributions(
         self, 
@@ -971,14 +1091,6 @@ class Clusterer(util.ROICaT_Module):
                     Distance at which the same and different distributions
                     crossover.
         """
-        self._fn_smooth = helpers.Convolver_1d(
-            kernel=torch.ones(self.smooth_window),
-            length_x=self.n_bins,
-            pad_mode='same',
-            correct_edge_effects=True,
-            device='cpu',
-        ).convolve
-
         edges = torch.linspace(0,1, self.n_bins+1, dtype=torch.float32)
         
         d_all = d_conj.copy()
@@ -990,6 +1102,8 @@ class Clusterer(util.ROICaT_Module):
 
         d_intra = d_conj.multiply(self.s_sesh_inv)
         d_intra.eliminate_zeros()
+        if len(d_intra.data) == 0:
+            return None, None, None, None, None, None
         counts, _ = torch.histogram(torch.as_tensor(d_intra.data, dtype=torch.float32), edges)
         # dens_diff = fn_smooth(counts / counts.sum())  ## distances of known differents
         # dens_diff = counts / counts.sum()  ## distances of known differents
@@ -1139,26 +1253,34 @@ class Clusterer(util.ROICaT_Module):
         d_dense.fill_value = (dist_mat.data.max() - dist_mat.data.min()).astype(np.float16) * 10
         d_dense = d_dense.todense()
         np.fill_diagonal(d_dense, 0)
-        rs_sil = sklearn.metrics.silhouette_samples(X=d_dense, labels=labels, metric='precomputed')
+        ## Number of labels must be at least 2
+        if len(np.unique(labels)) < 2:
+            warnings.warn(f"Silhouette samples calculation requires at least 2 labels. Returning None. Found {len(np.unique(labels))} labels.")
+            rs_sil = None
+        else:
+            rs_sil = sklearn.metrics.silhouette_samples(X=d_dense, labels=labels, metric='precomputed')
 
-        self.quality_metrics = {
-            'cluster_labels_unique': labels_unique,
-            'cluster_intra_means': cs_intra_means,
-            'cluster_intra_mins': cs_intra_mins,
-            'cluster_intra_maxs': cs_intra_maxs,
-            'cluster_silhouette': cs_sil,
-            'sample_silhouette': rs_sil,
+        def to_list_of_floats(x):
+            return [float(i) for i in x]
+
+        self.quality_metrics = util.JSON_Dict({
+            'cluster_labels_unique': to_list_of_floats(labels_unique),
+            'cluster_intra_means': to_list_of_floats(cs_intra_means),
+            'cluster_intra_mins': to_list_of_floats(cs_intra_mins),
+            'cluster_intra_maxs': to_list_of_floats(cs_intra_maxs),
+            'cluster_silhouette': to_list_of_floats(cs_sil),
+            'sample_silhouette': to_list_of_floats(rs_sil),
             'hdbscan': {
-                'sample_outlierScores': self.hdbs.outlier_scores_[:-1],  ## Remove last element which is the outlier score for the new fully connected node
-                'sample_probabilities': self.hdbs.probabilities_[:-1],  ## Remove last element which is the outlier score for the new fully connected node
+                'sample_outlierScores': to_list_of_floats(self.hdbs.outlier_scores_[:-1]),  ## Remove last element which is the outlier score for the new fully connected node
+                'sample_probabilities': to_list_of_floats(self.hdbs.probabilities_[:-1]),  ## Remove last element which is the outlier score for the new fully connected node
             }  if hasattr(self, 'hdbs') else None,
             'sequentialHungarian': {
-                'performance_recall': self.seqHung_performance['recall'],
-                'performance_precision': self.seqHung_performance['precision'],
-                'performance_f1': self.seqHung_performance['f1_score'],
-                'performance_accuracy': self.seqHung_performance['accuracy'],
+                'performance_recall': float(self.seqHung_performance['recall']),
+                'performance_precision': float(self.seqHung_performance['precision']),
+                'performance_f1': float(self.seqHung_performance['f1_score']),
+                'performance_accuracy': float(self.seqHung_performance['accuracy']),
             } if hasattr(self, 'seqHung_performance') else None,
-        }
+        })
         return self.quality_metrics
         
 
@@ -1422,4 +1544,35 @@ def make_label_variants(
     assert np.allclose(labels_bool.nonzero()[1] - 1, labels_squeezed)
     assert np.all([np.allclose(np.where(labels_squeezed==u)[0], ldu) for u, ldu in labels_dict.items()])
 
+    ## Convert everything to native python types for JSON compatibility
+    labels_squeezed = util.JSON_List([int(u) for u in labels_squeezed])
+    labels_bySession = util.JSON_List([[int(u) for u in l] for l in labels_bySession])
+    labels_dict = util.JSON_Dict({str(k): [int(v_i) for v_i in v] for k, v in labels_dict.items()})  ## Make keys strings for JSON compatibility
+
     return labels_squeezed, labels_bySession, labels_bool, labels_bool_bySession, labels_dict
+
+
+def plot_quality_metrics(quality_metrics: dict, labels: Union[np.ndarray, list], n_sessions: int) -> None:
+    fig, axs = plt.subplots(nrows=2, ncols=2, figsize=(15,7))
+
+    axs[0,0].hist(quality_metrics['cluster_silhouette'], 50);
+    axs[0,0].set_xlabel('cluster_silhouette');
+    axs[0,0].set_ylabel('cluster counts');
+
+    axs[0,1].hist(quality_metrics['cluster_intra_means'], 50);
+    axs[0,1].set_xlabel('cluster_intra_means');
+    axs[0,1].set_ylabel('cluster counts');
+
+    axs[1,0].hist(quality_metrics['sample_silhouette'], 50);
+    axs[1,0].set_xlabel('sample_silhouette score');
+    axs[1,0].set_ylabel('roi sample counts');
+
+    _, counts = np.unique(labels[labels!=-1], return_counts=True)
+
+    axs[1,1].hist(counts, n_sessions*2 + 1, range=(0, n_sessions+1));
+    axs[1,1].set_xlabel('n_sessions')
+    axs[1,1].set_ylabel('cluster counts');
+    
+    # Make the title include the number of excluded (label==-1) ROIs
+    fig.suptitle(f'Quality metrics n_excluded: {np.sum(labels==-1)}, n_included: {np.sum(labels!=-1)}, n_total: {len(labels)}, n_clusters: {len(np.unique(labels[labels!=-1]))}, n_sessions: {n_sessions}')
+    return fig, axs

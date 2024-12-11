@@ -55,7 +55,7 @@ class Autotuner_regression(util.ROICaT_Module):
         cv (Type[sklearn.model_selection._split.BaseCrossValidator]):
             A Scikit-Learn cross-validator class.
             Must have: \n
-                * Call signature: ``idx_train, idx_test = next(self.cv.split(self.X, self.y))``
+                * Call signature: ``idx_train, idx_test = next(self.cv.split(self.X, self.y))`` \n
         fn_loss (Callable):
             Function to compute the loss.
             Must have: \n
@@ -88,10 +88,10 @@ class Autotuner_regression(util.ROICaT_Module):
         .. highlight:: python
         .. code-block:: python
     
-        params = {
-            'C':             {'type': 'real',        'kwargs': {'log': True, 'low': 1e-4, 'high': 1e4}},
-            'penalty':       {'type': 'categorical', 'kwargs': {'choices': ['l1', 'l2']}},
-        }
+            params = {
+                'C':             {'type': 'real',        'kwargs': {'log': True, 'low': 1e-4, 'high': 1e4}},
+                'penalty':       {'type': 'categorical', 'kwargs': {'choices': ['l1', 'l2']}},
+            }
     """
     def __init__(
         self, 
@@ -116,6 +116,8 @@ class Autotuner_regression(util.ROICaT_Module):
         """
         Initializes the AutotunerRegression with the given model class, parameters, data, and settings.
         """
+        super().__init__()
+        
         ## Set model variables
         self.X = X  ## shape (n_samples, n_features)
         self.y = y  ## shape (n_samples,)
@@ -679,7 +681,7 @@ class Auto_LogisticRegression(Autotuner_regression):
             'best model',
         ])
 
-class Load_ONNX_model_sklearnLogisticRegression():
+class ONNX_model_sklearnLogisticRegression():
     """
     Loads an ONNX model of an sklearn LogisticRegression model into a runtime
     session.
@@ -758,3 +760,5 @@ class Load_ONNX_model_sklearnLogisticRegression():
         ## convert proba_dict to an array
         proba = np.stack([np.array([r[key] for r in proba_dict], dtype=np.float32) for key in proba_dict[0].keys()], axis=1)
         return preds, proba
+    
+Load_ONNX_model_sklearnLogisticRegression = ONNX_model_sklearnLogisticRegression  ## For legacy support
