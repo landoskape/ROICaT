@@ -300,7 +300,7 @@ class ROI_graph(util.ROICaT_Module):
         """
         ## if there are no ROIs in the block
         if spatialFootprints.shape[0] == 0:
-            return None, None, None, None
+            return None, None, None, None, None
         
         # check optional arguments related to additional features
         if features_additional is not None:
