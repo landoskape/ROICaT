@@ -363,6 +363,7 @@ def select_region_scatterPlot(
     alpha_points: float = 0.5,
     size_points: float = 1,
     color_points: Union[str, List[str]] = 'k',
+    selection_callback: Optional[Callable[[List[int]], None]] = None,
 ) -> Tuple[Callable, object, str]:
     """
     Selects a region of a scatter plot and returns the indices of the points in
@@ -401,6 +402,12 @@ def select_region_scatterPlot(
             Size of the scatter plot points. (Default is 1)
         color_points (Union[str, List[str]], optional): 
             Color of the scatter plot points. Single color only.
+            (Default is 'k')
+        selection_callback (Callable, optional):
+            Callback function that is called when the selection is changed. The
+            function must take a single argument, which is a list of integers
+            representing the indices of the selected points. If none provided,
+            will only write to temp file. (Default is ``None``)
 
     Returns:
         (Tuple[Callable, object, str]): tuple containing:
@@ -465,9 +472,16 @@ def select_region_scatterPlot(
         with open(path_tempFile, 'w') as f:
             f.write(','.join([str(i) for i in index]))
 
+        # Call selection callback if provided
+        if selection_callback is not None:
+            selection_callback(index)
+
+        print("Callback from bokeh")
+
         return points
         
     selection.param.watch_values(callback, 'index')
+
     layout = points.opts(
         tools=['lasso_select', 'box_select'],
         width=figsize[0],

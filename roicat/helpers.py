@@ -2523,6 +2523,9 @@ class ImageLabeler:
             between 0 and 255 and will be converted to uint8.
         start_index (int): 
             The index of the first image to display. (Default is *0*)
+        idx_selection (Optional[List[int]]):
+            A list of indices to select from the image array. If ``None``, all
+            images are selected. (Default is ``None``)
         path_csv (str): 
             Path to the CSV file for saving results. If ``None``, results will
             not be saved.
@@ -2558,8 +2561,6 @@ class ImageLabeler:
             A numpy array of images. Either 3D: *(n_images, height, width)* or
             4D: *(n_images, height, width, n_channels)*. Images should be scaled
             between 0 and 255 and will be converted to uint8.
-        start_index (int): 
-            The index of the first image to display. (Default is *0*)
         path_csv (str): 
             Path to the CSV file for saving results. If ``None``, results will
             not be saved.
@@ -2587,7 +2588,9 @@ class ImageLabeler:
     def __init__(
         self, 
         image_array: np.ndarray, 
-        start_index: int=0,
+        start_index: int = 0,
+        idx_selection: Optional[List[int]] = None,
+        random_order: bool = False,
         path_csv: Optional[str] = None, 
         save_csv: bool = True,
         resize_factor: float = 10.0, 
@@ -2607,6 +2610,8 @@ class ImageLabeler:
         self.images = image_array
         self._resize_factor = resize_factor
         self._index = start_index - 1  ## -1 because we increment before displaying
+        self._random_order = random_order
+        self.update_selection(idx_selection)
         self.path_csv = path_csv if path_csv is not None else str(Path(tempfile.gettempdir()) / ('roicat_labels_' + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + '.csv'))
         self._save_csv = save_csv
         self.labels_ = {}
@@ -2616,6 +2621,7 @@ class ImageLabeler:
         self._key_next = key_next if key_next is not None else None
         self._normalize_images = normalize_images
         self._verbose = verbose
+        self._root = None
 
         self.__call__ = self.run
         
@@ -2650,16 +2656,45 @@ class ImageLabeler:
 
     def __enter__(self):
         return self
+    
     def __exit__(self, exc_type, exc_value, traceback):
         self.end_session(None)
+
+    def _get_current_idx(self):
+        """Central method for getting the current image index."""
+        return self._idx_selection[self._index]
+    
+    def update_selection(self, idx_selection: List[int]):
+        """
+        Updates the selection of images to classify. The selection is a list of
+        indices to select from the image array. Will show the first image in the
+        new selection.
+
+        Args:
+            idx_selection (List[int]):
+                A list of indices to select from the image array.
+        """
+        print("Hello from update_selection")
+        if idx_selection is not None:
+            # Check if provided list is valid
+            if min(idx_selection) < 0 or max(idx_selection) >= len(self.images):
+                raise ValueError('idx_selection exceeds range of images (must be in [0, len(image_array)-1]).')
+        self._idx_selection = idx_selection if idx_selection is not None else list(range(len(self.images))) 
+        if self._random_order:
+            np.random.shuffle(self._idx_selection)
+        self._index = -1
+        if hasattr(self, '_root') and self._root is not None:
+            # Only attempt to go to next image if the window is open
+            print("Hello from update_selection -- next_img now")
+            self.next_img()
 
     def next_img(self, event=None):
         """Displays the next image in the array, and resizes the image."""
         ## Display the image
         ### End the session if there are no more images
         self._index += 1
-        if self._index < len(self.images):
-            im = self.images[self._index]
+        if self._index < len(self._idx_selection):
+            im = self.images[self._get_current_idx()]
             im = (im / np.max(im)) * 255 if self._normalize_images else im
             pil_img = PIL.Image.fromarray(np.uint8(im))  ## Convert to uint8 and PIL image
             ## Resize image
@@ -2674,7 +2709,7 @@ class ImageLabeler:
         else:
             self.end_session(None)
         
-        self._root.title(str(self._index))  # update the window title to the current image index
+        self._root.title(str(self._get_current_idx()))  # update the window title to the current image index
 
     def prev_img(self, event=None):
         """
@@ -2694,8 +2729,8 @@ class ImageLabeler:
         """
         label = event.char
         if label != '':
-            print(f'Image {self._index}: {label}') if self._verbose else None
-            self.labels_.update({self._index: str(label)})  ## Store the label
+            print(f'Image {self._get_current_idx()}: {label}') if self._verbose else None
+            self.labels_.update({self._get_current_idx(): str(label)})  ## Store the label
             self.save_classification() if self._save_csv else None ## Save the results
             self.next_img()  ## Move to the next image
 
